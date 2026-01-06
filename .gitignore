@@ -203,3 +203,39 @@ calibration_*.npy
 # Training logs
 args.yaml
 results.csv
+
+# ===== UESTC4006P project artifacts =====
+# YOLO config/cache (we set YOLO_CONFIG_DIR to uestc4006p/.yolo_config)
+uestc4006p/.yolo_config/
+
+# Training / validation / prediction outputs
+uestc4006p/runs/
+**/runs/
+
+# Weights / exports / logs (if generated elsewhere)
+**/weights/
+**/exports/
+**/logs/
+
+# Dataset copies (should stay in E:\Large Files\...)
+datasets/
+**/datasets/
+
+# Common large artifacts
+*.pt
+*.onnx
+*.engine
+*.pth
+*.ckpt
+*.zip
+*.rar
+*.7z
+*.tar
+*.tar.gz
+
+# Python caches
+__pycache__/
+*.pyc
+.ipynb_checkpoints/
+.venv/
+.env
