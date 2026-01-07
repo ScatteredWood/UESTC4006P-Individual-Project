@@ -19,7 +19,8 @@ seg_CRACK500_all_yolov8n-seg_640_ep100_bs8_seed42_baseline__augv1
 - checkpoint 归档：<REPO_ROOT>/uestc4006p/checkpoints/<exp_id>/{best,last}.pt
 - 预训练权重：<REPO_ROOT>/weights/*.pt
 - Ultralytics 缓存/配置：<REPO_ROOT>/uestc4006p/.yolo_config/
-- 数据集：放在 E:\Large Files\...\datasets\public（你已统一）
+- 数据集：放在 E:\Large Files\...\datasets\public
+（你已统一）
 """
 
 import argparse
@@ -29,6 +30,14 @@ import shutil
 import os
 
 from ultralytics import YOLO
+
+# ===================== [新增] wakepy 安全导入 =====================
+try:
+    from wakepy import keep
+    HAS_WAKEPY = True
+except ImportError:
+    HAS_WAKEPY = False
+# =================================================================
 
 
 # ===================== 路径修复：永远以“仓库根目录”为基准 =====================
@@ -47,12 +56,13 @@ os.environ.setdefault("YOLO_CONFIG_DIR", str(YOLO_CONFIG_DIR))
 
 
 # ***************** 以后你要改超参数，就改这里（也可用命令行覆盖） *****************
-DEFAULT_IMGSZ   = 640
-DEFAULT_EPOCHS  = 50
-DEFAULT_BATCH   = 16
+DEFAULT_IMGSZ   = 800      # [建议] v11s模型较小，把分辨率拉到800，对路面裂缝检测效果极好
+DEFAULT_EPOCHS  = 300      # 给够上限
+DEFAULT_BATCH   = 32       # [建议] 16G显存跑v11s，batch=32妥妥的，甚至可以尝试64
 DEFAULT_DEVICE  = "0"    # "0" / "cpu" / "0,1"
 DEFAULT_WORKERS = 8
 DEFAULT_SEED    = 42
+DEFAULT_PATIENCE = 50     # [新增] 默认 50 轮不涨就停
 
 DEFAULT_RUNS_ROOT = RUNS_ROOT
 DEFAULT_CHECKPOINT_ROOT = CHECKPOINT_ROOT
@@ -219,27 +229,47 @@ def main():
 
     model = YOLO(str(cfg.model))
 
-    # 训练：project/name 都是绝对路径 -> 不会再出现 scripts\uestc4006p\runs 的重复
-    model.train(
-        task=cfg.task,
-        data=str(cfg.data_yaml),
-        imgsz=cfg.imgsz,
-        epochs=cfg.epochs,
-        batch=cfg.batch,
-        device=cfg.device,
-        workers=cfg.workers,
-        seed=cfg.seed,
-        project=str(cfg.runs_root),
-        name=cfg.exp_id(),
-        exist_ok=cfg.exist_ok,
-        save=True,
-        save_period=10,
-    )
+    # ===================== [修改] 使用 wakepy 上下文保护训练过程 =====================
+    def start_training():
+        # 检查传入的模型路径是不是 last.pt，如果是，就自动开启断点续训
+        is_resume = "last.pt" in str(cfg.model) 
+    
+        print(f"--- 续训状态: {is_resume} ---")
 
-    # 归档 best/last（稳定位置）
-    wdir = cfg.ul_run_dir() / "weights"
-    copy_if_exists(wdir / "best.pt", cfg.checkpoint_dir() / "best.pt")
-    copy_if_exists(wdir / "last.pt", cfg.checkpoint_dir() / "last.pt")
+        # 训练：project/name 都是绝对路径 -> 不会再出现 scripts\uestc4006p\runs 的重复
+        model.train(
+            task=cfg.task,
+            data=str(cfg.data_yaml),
+            imgsz=cfg.imgsz,
+            epochs=cfg.epochs,
+            batch=cfg.batch,
+            device=cfg.device,
+            workers=cfg.workers,
+            seed=cfg.seed,
+            # ---------------------------
+            patience=50,      # <--- [新增] 建议设置为 50
+            resume=is_resume,
+            exist_ok=cfg.exist_ok,
+            # exist_ok=True,      # <--- [关键] 设置为 True 以支持断点续训
+            # ---------------------------
+            project=str(cfg.runs_root),
+            name=cfg.exp_id(),
+            save=True,
+            save_period=10,
+        )
+
+        # 归档 best/last（稳定位置）
+        wdir = cfg.ul_run_dir() / "weights"
+        copy_if_exists(wdir / "best.pt", cfg.checkpoint_dir() / "best.pt")
+        copy_if_exists(wdir / "last.pt", cfg.checkpoint_dir() / "last.pt")
+
+    if HAS_WAKEPY:
+        print("☕ wakepy 模式已开启：训练期间电脑将保持清醒状态...")
+        with keep.presenting():
+            start_training()
+    else:
+        start_training()
+    # ===============================================================================
 
     print("✅ TRAIN DONE")
     print("RUN_DIR:", cfg.ul_run_dir())
