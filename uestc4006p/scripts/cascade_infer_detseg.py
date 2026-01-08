@@ -1,19 +1,20 @@
 """
-UESTC4006P - Cascade Inference v3 (Det -> Crop/Tile -> Seg -> Stitch Back)
-=========================================================================
+UESTC4006P - Cascade Inference v3c (Class-Aware) (Det -> Crop/Tile -> Seg -> Stitch Back)
+=======================================================================================
 
 适用场景：
 - Seg 用 CRACK500 等近景裂缝数据训练（patch 分布）
 - 推理在 RDD 等远景整图（尺度差异巨大）
-- Det 框可能很大（如 D20 框到整块路面/斑马线），直接 ROI->Seg 会尺度塌缩导致 mask 全空
+- Det 框可能很大（如 D20/D40 框到整块路面/斑马线），直接 ROI->Seg 会尺度塌缩导致 mask 全空
 
-核心改进（v3）：
+v3c 核心增强（适合中期展示）：
 1) Seg 推理显式 imgsz 可调（默认 1280）
-2) ROI 过大时自动 tile（滑窗 + overlap），把远景问题“变回近景分布”
-3) 可选：只用部分 det 类、过滤超大框、后处理去噪、debug 输出 ROI 可视化
+2) ROI 过大时自动 tile（滑窗 + overlap）
+3) Class-aware 策略：对 D20/D40（大纹理型病害）启用更强 tile、更松阈值、可选 CLAHE
+4) 可选：只用部分 det 类、过滤超大框、后处理去噪、debug 输出 ROI/Tile 可视化
 
 输出：
-- <image>__mask.png      : stitched binary mask (255=crack)
+- <image>__mask.png      : stitched binary mask (255=crack-like)
 - <image>__overlay.jpg   : det boxes + red mask overlay
 - RUN_INFO.txt           : 运行参数与权重、数据来源记录
 - debug_rois/* (可选)    : ROI/Tile 叠加图，方便定位“为什么 seg 空”
@@ -21,7 +22,6 @@ UESTC4006P - Cascade Inference v3 (Det -> Crop/Tile -> Seg -> Stitch Back)
 
 import argparse
 from pathlib import Path
-import os
 import cv2
 import numpy as np
 from ultralytics import YOLO
@@ -125,6 +125,17 @@ def postprocess_mask(mask_u8: np.ndarray, open_ksize=0, min_area=0):
 
     return out
 
+def clahe_bgr(img_bgr: np.ndarray, clip=2.0, grid=8):
+    """
+    轻量局部对比度增强（仅建议对 D20/D40 类 ROI 使用）
+    """
+    lab = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2LAB)
+    l, a, b = cv2.split(lab)
+    clahe = cv2.createCLAHE(clipLimit=float(clip), tileGridSize=(int(grid), int(grid)))
+    l2 = clahe.apply(l)
+    lab2 = cv2.merge([l2, a, b])
+    return cv2.cvtColor(lab2, cv2.COLOR_LAB2BGR)
+
 def seg_on_roi_with_tiling(
     seg_model: YOLO,
     roi_bgr: np.ndarray,
@@ -182,33 +193,52 @@ def seg_on_roi_with_tiling(
 
 # ===================== 主流程（单图） =====================
 
-def cascade_one_image_v3(
+def cascade_one_image_v3c(
     img_bgr: np.ndarray,
     det_model: YOLO,
     seg_model: YOLO,
-    det_conf=0.20,
+    det_conf=0.15,
     det_iou=0.50,
-    seg_conf=0.15,
+
+    # base seg policy (for D00/D10)
+    seg_conf=0.10,
     seg_thr=0.30,
     seg_imgsz=1280,
+
     pad_ratio=0.15,
     pad_min=16,
     max_rois=80,
     allowed_det_classes=None,      # e.g. [0] or None
-    max_area_ratio=0.60,           # 超大框过滤（占整图比例过大直接跳过，或交给 tile）
-    tile_min_side=1400,            # ROI 过大触发 tile
+
+    max_area_ratio=0.60,           # det box area ratio vs full image (only for logging/guard)
+
+    # base tiling policy
+    tile_min_side=1400,
     tile=1280,
     overlap=256,
     use_tile_for_big_roi=True,
+
+    # class-aware big damage policy (for D20/D40)
+    big_damage_class_ids=(2, 3),
+    big_seg_conf=0.08,
+    big_seg_thr=0.25,
+    big_seg_imgsz=1280,
+    big_force_tile=True,
+    big_tile=1280,
+    big_overlap=384,
+    big_use_clahe=False,
+    clahe_clip=2.0,
+    clahe_grid=8,
+
     debug_dir: Path = None,
     debug_prefix: str = "",
+
     post_open_ksize=0,
     post_min_area=0,
 ):
     H, W = img_bgr.shape[:2]
     full_mask = np.zeros((H, W), dtype=np.uint8)
 
-    # 1) det on full image
     det_res = det_model.predict(img_bgr, conf=det_conf, iou=det_iou, verbose=False)[0]
     if det_res.boxes is None or len(det_res.boxes) == 0:
         return full_mask, det_res
@@ -217,7 +247,7 @@ def cascade_one_image_v3(
     conf = det_res.boxes.conf.detach().cpu().numpy()
     cls  = det_res.boxes.cls.detach().cpu().numpy().astype(int)
 
-    # 2) 过滤类别（如只用 D00）
+    # filter classes
     idx = np.arange(len(xyxy))
     if allowed_det_classes is not None:
         allowed = set(allowed_det_classes)
@@ -228,70 +258,93 @@ def cascade_one_image_v3(
 
     xyxy = xyxy[idx]
     conf = conf[idx]
+    cls  = cls[idx]
 
-    # 3) 限制 ROI 数量
+    # limit rois
     if len(xyxy) > max_rois:
         order = np.argsort(-conf)[:max_rois]
         xyxy = xyxy[order]
         conf = conf[order]
+        cls  = cls[order]
 
-    # 4) crop -> seg/tile -> stitch
     roi_id = 0
-    for (x1, y1, x2, y2) in xyxy:
-        roi_id += 1
+    big_ids = set(int(x) for x in big_damage_class_ids)
 
-        # 扩框
+    for (box, ccls) in zip(xyxy, cls):
+        roi_id += 1
+        det_class = int(ccls)
+        x1, y1, x2, y2 = box.tolist()
+
+        # expand
         x1, y1, x2, y2 = expand_box(x1, y1, x2, y2, W, H, pad_ratio, pad_min)
         bw, bh = (x2 - x1), (y2 - y1)
-
-        # 超大 det 框处理（避免整图级框直接拖垮）
-        if (bw * bh) > max_area_ratio * (W * H):
-            # 你也可以选择这里 continue；我默认“仍允许 tile”，但不建议直接单次 seg
-            pass
+        _ = (bw * bh) / max(1.0, (W * H))  # for potential future guard
 
         roi = img_bgr[y1:y2, x1:x2]
         rh, rw = roi.shape[:2]
         if rh < 2 or rw < 2:
             continue
 
-        # debug：保存 ROI 原图（可选）
-        if debug_dir is not None:
-            cv2.imwrite(str(debug_dir / f"{debug_prefix}__roi_{roi_id:03d}_{x1}_{y1}_{x2}_{y2}.jpg"), roi)
+        # choose policy by det class
+        is_big = det_class in big_ids
 
-        # 是否 tile
-        big_roi = (max(rh, rw) >= tile_min_side)
-        if use_tile_for_big_roi and big_roi:
+        if is_big and big_use_clahe:
+            roi = clahe_bgr(roi, clip=clahe_clip, grid=clahe_grid)
+
+        # pick local parameters
+        if is_big:
+            local_seg_conf  = float(big_seg_conf)
+            local_seg_thr   = float(big_seg_thr)
+            local_seg_imgsz = int(max(seg_imgsz, big_seg_imgsz))
+            local_tile      = int(big_tile)
+            local_overlap   = int(big_overlap)
+            force_tile      = bool(big_force_tile)
+            local_tile_min_side = 0  # force trigger
+        else:
+            local_seg_conf  = float(seg_conf)
+            local_seg_thr   = float(seg_thr)
+            local_seg_imgsz = int(seg_imgsz)
+            local_tile      = int(tile)
+            local_overlap   = int(overlap)
+            force_tile      = False
+            local_tile_min_side = int(tile_min_side)
+
+        if debug_dir is not None:
+            cv2.imwrite(str(debug_dir / f"{debug_prefix}__c{det_class}__roi_{roi_id:03d}_{x1}_{y1}_{x2}_{y2}.jpg"), roi)
+
+        # tile decision
+        big_roi = True if force_tile else (max(rh, rw) >= local_tile_min_side)
+        use_tile = use_tile_for_big_roi and (big_roi if (not force_tile) else True)
+
+        if use_tile:
             roi_mask = seg_on_roi_with_tiling(
                 seg_model,
                 roi,
-                seg_conf=seg_conf,
-                seg_thr=seg_thr,
-                seg_imgsz=seg_imgsz,
-                tile=tile,
-                overlap=overlap,
+                seg_conf=local_seg_conf,
+                seg_thr=local_seg_thr,
+                seg_imgsz=local_seg_imgsz,
+                tile=local_tile,
+                overlap=local_overlap,
                 debug_dir=debug_dir,
-                debug_prefix=f"{debug_prefix}__roi{roi_id:03d}"
+                debug_prefix=f"{debug_prefix}__c{det_class}__roi{roi_id:03d}"
             )
         else:
             seg_res = seg_model.predict(
                 roi,
-                conf=seg_conf,
+                conf=local_seg_conf,
                 iou=0.5,
-                imgsz=seg_imgsz,
+                imgsz=local_seg_imgsz,
                 verbose=False
             )[0]
-            roi_mask = yolo_seg_union_mask(seg_res, rh, rw, seg_conf=seg_conf, thr=seg_thr)
+            roi_mask = yolo_seg_union_mask(seg_res, rh, rw, seg_conf=local_seg_conf, thr=local_seg_thr)
 
-        # 可选后处理（在 ROI 层做，减少噪点但别伤细裂缝）
         if post_open_ksize or post_min_area:
             roi_mask = postprocess_mask(roi_mask, open_ksize=post_open_ksize, min_area=post_min_area)
 
-        # debug：保存 ROI overlay（可选）
         if debug_dir is not None:
             roi_ov = overlay_mask_red(roi, roi_mask, alpha=0.55)
-            cv2.imwrite(str(debug_dir / f"{debug_prefix}__roi_{roi_id:03d}_{x1}_{y1}_{x2}_{y2}__overlay.jpg"), roi_ov)
+            cv2.imwrite(str(debug_dir / f"{debug_prefix}__c{det_class}__roi_{roi_id:03d}_{x1}_{y1}_{x2}_{y2}__overlay.jpg"), roi_ov)
 
-        # stitch back
         full_mask[y1:y2, x1:x2] = np.maximum(full_mask[y1:y2, x1:x2], roi_mask)
 
     return full_mask, det_res
@@ -313,36 +366,53 @@ def main():
     ap.add_argument("--det", required=True, help="path to det best.pt")
     ap.add_argument("--seg", required=True, help="path to seg best.pt (yolov8n-seg)")
     ap.add_argument("--source", required=True, help="image file or directory")
-    ap.add_argument("--outdir", default="uestc4006p/runs/cascade", help="output dir")
+    ap.add_argument("--outdir", default="uestc4006p/runs", help="output dir")
 
-    # Det 参数（召回优先）
+    # Det params
     ap.add_argument("--det-conf", type=float, default=0.15)
     ap.add_argument("--det-iou", type=float, default=0.50)
 
-    # Seg 参数（建议先偏召回）
+    # Base seg params (for D00/D10)
     ap.add_argument("--seg-conf", type=float, default=0.10)
     ap.add_argument("--seg-thr",  type=float, default=0.30)
-    ap.add_argument("--seg-imgsz", type=int, default=1280, help="seg inference imgsz, e.g. 1024/1280/1536")
+    ap.add_argument("--seg-imgsz", type=int, default=1280)
 
-    # ROI 与级联
+    # ROI & cascade
     ap.add_argument("--pad-ratio", type=float, default=0.15)
     ap.add_argument("--pad-min", type=int, default=16)
     ap.add_argument("--max-rois", type=int, default=80)
-    ap.add_argument("--det-classes", nargs="*", type=int, default=None, help="e.g. --det-classes 0 (only D00)")
+    ap.add_argument("--det-classes", nargs="*", type=int, default=None)
 
-    # 超大框/超大 ROI 控制
-    ap.add_argument("--max-area-ratio", type=float, default=0.60, help="det box area ratio vs full image")
-    ap.add_argument("--tile-min-side", type=int, default=1400, help="ROI side >= this triggers tiling")
+    ap.add_argument("--max-area-ratio", type=float, default=0.60)
+
+    # Base tiling params
+    ap.add_argument("--tile-min-side", type=int, default=1400)
     ap.add_argument("--tile", type=int, default=1280)
     ap.add_argument("--overlap", type=int, default=256)
-    ap.add_argument("--no-tile", action="store_true", help="disable tiling even for big ROI")
+    ap.add_argument("--no-tile", action="store_true")
 
-    # 后处理（可选）
-    ap.add_argument("--post-open", type=int, default=0, help="morph open ksize (0=off, suggest 3)")
-    ap.add_argument("--post-min-area", type=int, default=0, help="min connected component area (0=off)")
+    # Class-aware: big damage classes (D20/D40)
+    ap.add_argument("--big-classes", nargs="*", type=int, default=[2, 3],
+                    help="det class ids treated as big-damage (default: 2 3)")
+    ap.add_argument("--big-seg-conf", type=float, default=0.08)
+    ap.add_argument("--big-seg-thr",  type=float, default=0.25)
+    ap.add_argument("--big-seg-imgsz", type=int, default=1280)
+    ap.add_argument("--big-force-tile", action="store_true",
+                    help="force tiling for big classes (recommended)")
+    ap.add_argument("--big-tile", type=int, default=1280)
+    ap.add_argument("--big-overlap", type=int, default=384)
 
-    # debug（可选）
-    ap.add_argument("--debug-rois", action="store_true", help="save ROI/tile overlays for debugging")
+    ap.add_argument("--big-clahe", action="store_true",
+                    help="apply CLAHE on ROI for big classes (optional)")
+    ap.add_argument("--clahe-clip", type=float, default=2.0)
+    ap.add_argument("--clahe-grid", type=int, default=8)
+
+    # Postprocess (optional)
+    ap.add_argument("--post-open", type=int, default=0)
+    ap.add_argument("--post-min-area", type=int, default=0)
+
+    # Debug
+    ap.add_argument("--debug-rois", action="store_true")
 
     args = ap.parse_args()
 
@@ -356,7 +426,6 @@ def main():
 
     det_model = YOLO(str(det_path))
     seg_model = YOLO(str(seg_path))
-
     det_names = det_model.names if hasattr(det_model, "names") else {}
 
     src = Path(args.source)
@@ -373,7 +442,7 @@ def main():
     det_short = short_tag_from_ckpt_parent(det_path.parent.name, "det")
     seg_short = short_tag_from_ckpt_parent(seg_path.parent.name, "seg")
 
-    run_dir = outdir / f"cascade_v3__{det_short}__{seg_short}"
+    run_dir = outdir / f"cascade_v3c__{det_short}__{seg_short}"
     ensure_dir(run_dir)
 
     debug_dir = None
@@ -381,10 +450,9 @@ def main():
         debug_dir = run_dir / "debug_rois"
         ensure_dir(debug_dir)
 
-    # RUN_INFO
     info_path = run_dir / "RUN_INFO.txt"
     with open(info_path, "w", encoding="utf-8") as f:
-        f.write("UESTC4006P - Cascade Inference v3 Run Info\n")
+        f.write("UESTC4006P - Cascade Inference v3c (Class-Aware) Run Info\n")
         f.write("====================================================\n")
         f.write(f"Time: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
         f.write("\n[Weights]\n")
@@ -394,36 +462,29 @@ def main():
         f.write(f"SOURCE: {src}\n")
         f.write("\n[Params]\n")
         f.write(f"det_conf={args.det_conf}, det_iou={args.det_iou}\n")
-        f.write(f"seg_conf={args.seg_conf}, seg_thr={args.seg_thr}, seg_imgsz={args.seg_imgsz}\n")
+        f.write(f"base_seg_conf={args.seg_conf}, base_seg_thr={args.seg_thr}, base_seg_imgsz={args.seg_imgsz}\n")
         f.write(f"pad_ratio={args.pad_ratio}, pad_min={args.pad_min}\n")
         f.write(f"max_rois={args.max_rois}, det_classes={args.det_classes if args.det_classes is not None else 'ALL'}\n")
         f.write(f"max_area_ratio={args.max_area_ratio}\n")
-        f.write(f"use_tile_for_big_roi={not args.no_tile}, tile_min_side={args.tile_min_side}\n")
-        f.write(f"tile={args.tile}, overlap={args.overlap}\n")
+        f.write(f"use_tile_for_big_roi={not args.no_tile}, tile_min_side={args.tile_min_side}, tile={args.tile}, overlap={args.overlap}\n")
+        f.write("\n[Class-aware Big-Damage Policy]\n")
+        f.write(f"big_classes={args.big_classes}\n")
+        f.write(f"big_seg_conf={args.big_seg_conf}, big_seg_thr={args.big_seg_thr}, big_seg_imgsz={args.big_seg_imgsz}\n")
+        f.write(f"big_force_tile={args.big_force_tile}, big_tile={args.big_tile}, big_overlap={args.big_overlap}\n")
+        f.write(f"big_clahe={args.big_clahe}, clahe_clip={args.clahe_clip}, clahe_grid={args.clahe_grid}\n")
+        f.write("\n[Postprocess]\n")
         f.write(f"post_open={args.post_open}, post_min_area={args.post_min_area}\n")
+        f.write("\n[Debug]\n")
         f.write(f"debug_rois={args.debug_rois}\n")
         f.write("\n[Outputs]\n")
-        f.write("- <image>__mask.png : final stitched binary mask (255=crack)\n")
+        f.write("- <image>__mask.png : final stitched binary mask (255=crack-like)\n")
         f.write("- <image>__overlay.jpg : det boxes + red mask overlay\n")
         if args.debug_rois:
             f.write("- debug_rois/* : ROI and tile overlays for debugging\n")
         f.write("====================================================\n")
 
     print("RUN_INFO:", info_path)
-    print("======================================================")
-    print("DET:", det_path)
-    print("SEG:", seg_path)
-    print("SOURCE:", src)
-    print("RUN_DIR:", run_dir)
-    print("PARAMS:",
-          f"det_conf={args.det_conf}, det_iou={args.det_iou}, "
-          f"seg_conf={args.seg_conf}, seg_thr={args.seg_thr}, seg_imgsz={args.seg_imgsz}, "
-          f"tile={'OFF' if args.no_tile else 'ON'}(min_side={args.tile_min_side}, tile={args.tile}, ov={args.overlap}), "
-          f"pad_ratio={args.pad_ratio}, pad_min={args.pad_min}, max_area_ratio={args.max_area_ratio}, "
-          f"post_open={args.post_open}, post_min_area={args.post_min_area}, debug_rois={args.debug_rois}"
-          )
-    print("DET_CLASSES:", args.det_classes if args.det_classes is not None else "ALL")
-    print("======================================================")
+    print("RUN_DIR :", run_dir)
 
     for p in images:
         img = cv2.imread(str(p))
@@ -432,7 +493,8 @@ def main():
             continue
 
         stem = p.stem
-        full_mask, det_res = cascade_one_image_v3(
+
+        full_mask, det_res = cascade_one_image_v3c(
             img,
             det_model,
             seg_model,
@@ -450,6 +512,18 @@ def main():
             tile=args.tile,
             overlap=args.overlap,
             use_tile_for_big_roi=(not args.no_tile),
+
+            big_damage_class_ids=tuple(int(x) for x in args.big_classes),
+            big_seg_conf=args.big_seg_conf,
+            big_seg_thr=args.big_seg_thr,
+            big_seg_imgsz=args.big_seg_imgsz,
+            big_force_tile=args.big_force_tile,
+            big_tile=args.big_tile,
+            big_overlap=args.big_overlap,
+            big_use_clahe=args.big_clahe,
+            clahe_clip=args.clahe_clip,
+            clahe_grid=args.clahe_grid,
+
             debug_dir=debug_dir,
             debug_prefix=stem,
             post_open_ksize=args.post_open,
