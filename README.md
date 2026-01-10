@@ -34,17 +34,3 @@ Typical dataset pairing used in this project:
 > - Datasets are not included in this repository. Please download them from their official sources and convert them into Ultralytics/YOLO formats as needed.
 
 ---
-
-## Getting Started
-
-### Environment
-- Python 3.8+ (recommended: 3.10+)
-- PyTorch (CUDA optional but recommended for training)
-- Ultralytics dependencies (inherited from upstream)
-
-### Installation (recommended)
-Clone this repository and install in editable mode:
-```bash
-git clone https://github.com/ScatteredWood/UESTC4006P-Individual-Project.git
-cd UESTC4006P-Individual-Project
-pip install -e .
