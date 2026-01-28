@@ -1,5 +1,5 @@
 # voc2yolo_det_build.py
-# 通用 VOC(XML) -> YOLO(det) 数据集构建：复制图片、生成labels、划分train/val、生成data.yaml
+# # 通用VOC(XML)→YOLO(det)数据集构建：解析XML转yolo txt，按比例划分train/val，复制图片/标签并生成data.yaml（可选复制test图片）
 # 适用于 RDD2022 / Pascal VOC 风格的任意检测数据集
 
 import os

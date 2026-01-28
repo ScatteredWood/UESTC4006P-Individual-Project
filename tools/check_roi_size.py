@@ -1,3 +1,5 @@
+# 读取meta.csv统计ROI裁剪框尺寸：最大宽高、以及w和h都>=768的ROI数量
+
 import csv
 
 path = r"E:\Large Files\UESTC4006P Individual Project (2025-26)\datasets\public\RDD2022_China_Pseudo_Raw_v0\pseg_v0_det20_sg400_tt900_t768o30_sc55_im1280_m2p2_oc11\meta.csv"

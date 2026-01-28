@@ -1,3 +1,5 @@
+# 将CRACK500的mask PNG转为YOLOv8-seg多边形标注：拷贝图像、轮廓提取+多边形逼近生成labels，并写data.yaml
+
 import cv2
 import numpy as np
 from pathlib import Path

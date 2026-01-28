@@ -1,5 +1,5 @@
 # check_pseudo_split_stats.py
-# 统计伪标签数据集：train/val 的正样本(非空label)与负样本(空label)数量
+# 统计伪标签YOLO数据集train/val的正样本(非空txt)与负样本(空/缺失txt)比例，并检查images与labels数量是否匹配
 
 from pathlib import Path
 

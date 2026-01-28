@@ -1,4 +1,6 @@
 # check_image_size.py
+# 统计目录下图片尺寸分布：抽样读取前50张，输出总数与宽高min/max
+
 from pathlib import Path
 import cv2
 

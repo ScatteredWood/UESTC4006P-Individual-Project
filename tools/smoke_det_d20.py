@@ -1,3 +1,5 @@
+# Det权重冒烟测试：随机抽取若干张图跑检测，自动找到D20类别id并逐图打印D20框数量，用于快速确认权重与类别映射是否正常
+
 from ultralytics import YOLO
 from pathlib import Path
 import random

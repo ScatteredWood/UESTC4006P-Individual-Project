@@ -1,5 +1,5 @@
 # tools/merge_rdd2022_all_norename.py
-# Merge RDD2022 multi-country VOC folders into ONE VOC-style dataset (NO renaming).
+# 合并多个RDD2022国家子数据集为一个VOC风格数据集（不重命名文件），复制train的images/xmls，可选合并test/images
 # Assumes filenames are already unique (e.g., Japan_000007.jpg).
 
 import argparse

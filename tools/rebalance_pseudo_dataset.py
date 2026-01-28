@@ -1,3 +1,5 @@
+# 伪标签数据集重采样：按train/val统计正/负样本，随机裁剪负样本使neg≤pos*NEG_PER_POS，拷贝到新目录并生成seg_pseudo.yaml
+
 from pathlib import Path
 import random, shutil
 

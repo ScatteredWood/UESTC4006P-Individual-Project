@@ -20,6 +20,8 @@ v3c 核心增强（适合中期展示）：
 - debug_rois/* (可选)    : ROI/Tile 叠加图，方便定位“为什么 seg 空”
 """
 
+# 级联推理v3c：Det出框→ROI裁剪/超大ROI滑窗切块→Seg分割→拼回整图；支持D20/D40类策略(更强tile/更松阈值/可选CLAHE)；输出mask/overlay/RUN_INFO与debug_rois
+
 import argparse
 from pathlib import Path
 import cv2
