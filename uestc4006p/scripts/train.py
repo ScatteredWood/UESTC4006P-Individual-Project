@@ -26,8 +26,12 @@ from dataclasses import dataclass
 from pathlib import Path
 import shutil
 import os
-
 from ultralytics import YOLO
+from naming_utils import (
+    make_output_dir_name,
+    write_run_meta_yaml,
+    now_iso,
+)
 
 # ===================== [新增] wakepy 安全导入 =====================
 try:
@@ -96,6 +100,8 @@ class ExpCfg:
     runs_root: Path = DEFAULT_RUNS_ROOT
     checkpoint_root: Path = DEFAULT_CHECKPOINT_ROOT
     exist_ok: bool = False
+    name_mode: str = "new"   # new | legacy
+    run_name: str = ""
 
     def task_short(self) -> str:
         return "det" if self.task == "detect" else ("seg" if self.task == "segment" else self.task)
@@ -107,11 +113,47 @@ class ExpCfg:
             base += f"__{self.note.strip().replace(' ', '-')}"
         return base
 
+    def main_dir_name(self) -> str:
+        return make_output_dir_name(
+            mode="train",
+            task=self.task_short(),
+            data=f"{self.dataset_name}_{self.domain}",
+            model=self.model_alias.strip() if self.model_alias else self.model.stem,
+            tag=self.tag,
+        )
+
+    def ensure_run_name(self):
+        if self.run_name:
+            return
+        if self.name_mode == "legacy":
+            self.run_name = self.exp_id()
+            return
+        base = self.main_dir_name()
+        idx = 1
+        while True:
+            cand = base if idx == 1 else f"{base}_{idx}"
+            if not (self.runs_root / cand).exists() and not (self.checkpoint_root / cand).exists():
+                self.run_name = cand
+                return
+            idx += 1
+
+    def run_project_and_name(self) -> tuple[Path, str]:
+        if self.name_mode == "legacy":
+            return self.runs_root, self.exp_id()
+        self.ensure_run_name()
+        return self.runs_root, self.run_name
+
     def ul_run_dir(self) -> Path:
-        return self.runs_root / self.exp_id()
+        if self.name_mode == "legacy":
+            return self.runs_root / self.exp_id()
+        self.ensure_run_name()
+        return self.runs_root / self.run_name
 
     def checkpoint_dir(self) -> Path:
-        return self.checkpoint_root / self.exp_id()
+        if self.name_mode == "legacy":
+            return self.checkpoint_root / self.exp_id()
+        self.ensure_run_name()
+        return self.checkpoint_root / self.run_name
 
 
 def ensure_dir(p: Path):
@@ -190,12 +232,14 @@ def main():
     ap.add_argument("--dataset-name", required=True)
     ap.add_argument("--domain", required=True)
     ap.add_argument("--model-alias", required=True)
-    ap.add_argument("--tag", default="baseline")
+    ap.add_argument("--tag", default="")
     ap.add_argument("--note", default="")
 
     # 输出路径
     ap.add_argument("--runs-root", default=str(DEFAULT_RUNS_ROOT))
     ap.add_argument("--checkpoint-root", default=str(DEFAULT_CHECKPOINT_ROOT))
+    ap.add_argument("--name-mode", choices=["new", "legacy"], default="new",
+                    help="输出命名：new=mode_task_data_model[_tag]，legacy=旧exp_id")
 
     ap.add_argument("--exist-ok", action="store_true")
     args = ap.parse_args()
@@ -220,6 +264,7 @@ def main():
         runs_root=Path(args.runs_root).resolve(),
         checkpoint_root=Path(args.checkpoint_root).resolve(),
         exist_ok=args.exist_ok,
+        name_mode=args.name_mode,
     )
 
     ensure_dir(cfg.runs_root)
@@ -228,7 +273,11 @@ def main():
     ensure_dir(YOLO_CONFIG_DIR)
 
     print("======================================================")
-    print("EXP_ID:", cfg.exp_id())
+    if cfg.name_mode == "legacy":
+        print("EXP_ID:", cfg.exp_id())
+    else:
+        cfg.ensure_run_name()
+        print("RUN_DIR:", cfg.run_name)
     print("CACHE MODE:", cfg.cache)
     print("======================================================")
 
@@ -238,6 +287,8 @@ def main():
     def start_training():
         is_resume = "last.pt" in str(cfg.model).lower()
         print(f"--- 续训状态: {is_resume} ---")
+        run_project, run_name = cfg.run_project_and_name()
+        ensure_dir(run_project)
 
         model.train(
             task=cfg.task,
@@ -255,8 +306,8 @@ def main():
 
             resume=is_resume,
             exist_ok=cfg.exist_ok,
-            project=str(cfg.runs_root),
-            name=cfg.exp_id(),
+            project=str(run_project),
+            name=run_name,
             save=True,
             save_period=10,
         )
@@ -264,6 +315,20 @@ def main():
         wdir = cfg.ul_run_dir() / "weights"
         copy_if_exists(wdir / "best.pt", cfg.checkpoint_dir() / "best.pt")
         copy_if_exists(wdir / "last.pt", cfg.checkpoint_dir() / "last.pt")
+
+        run_meta = {
+            "mode": "train",
+            "task": cfg.task_short(),
+            "dataset": f"{cfg.dataset_name}_{cfg.domain}",
+            "model": cfg.model_alias.strip() if cfg.model_alias else cfg.model.stem,
+            "tag": cfg.tag,
+            "created_at": now_iso(),
+            "weight_path": str(cfg.model),
+            "source": str(cfg.data_yaml),
+            "notes": cfg.note,
+        }
+        write_run_meta_yaml(cfg.ul_run_dir(), run_meta)
+        write_run_meta_yaml(cfg.checkpoint_dir(), run_meta)
 
     if HAS_WAKEPY:
         with keep.presenting():
