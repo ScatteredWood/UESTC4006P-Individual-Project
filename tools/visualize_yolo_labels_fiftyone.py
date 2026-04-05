@@ -4,8 +4,8 @@ import fiftyone as fo
 import fiftyone.utils.yolo as fouy
 import os
 
-img_dir = r"E:\Large Files\UESTC4006P Individual Project (2025-26)\datasets\public\crack500_SematicSeg305_China100_20260129\images"
-yolo_label_dir = r"E:\Large Files\UESTC4006P Individual Project (2025-26)\datasets\public\crack500_SematicSeg305_China100_20260129\labels"
+img_dir = r"E:\Large Files\UESTC4006P Individual Project (2025-26)\datasets\custom\crack500_SematicSeg305_ChinaSa100_crack-seg4029\images"
+yolo_label_dir = r"E:\Large Files\UESTC4006P Individual Project (2025-26)\datasets\custom\crack500_SematicSeg305_ChinaSa100_crack-seg4029\labels"
 
 classes = ["crack"] 
 
