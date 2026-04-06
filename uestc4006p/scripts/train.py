@@ -427,7 +427,6 @@ def main():
     # resume 模式在 metadata 继承后再校验
     cfg.validate_required_fields()
 
-    ensure_dir(cfg.ul_run_dir())
     ensure_dir(cfg.checkpoint_dir())
 
     print("======================================================")
@@ -446,7 +445,7 @@ def main():
         run_project, run_name = cfg.run_project_and_name()
         ensure_dir(run_project)
 
-        model.train(
+        results = model.train(
             task=cfg.task,
             data=str(cfg.data_yaml),
             imgsz=cfg.imgsz,
@@ -465,7 +464,8 @@ def main():
             save_period=10,
         )
 
-        wdir = cfg.ul_run_dir() / "weights"
+        actual_run_dir = Path(results.save_dir)
+        wdir = actual_run_dir / "weights"
         copy_if_exists(wdir / "best.pt", cfg.checkpoint_dir() / "best.pt")
         copy_if_exists(wdir / "last.pt", cfg.checkpoint_dir() / "last.pt")
 
@@ -486,7 +486,7 @@ def main():
         if is_resume:
             run_meta["resume_from"] = str(cfg.model)
 
-        write_run_meta_yaml(cfg.ul_run_dir(), run_meta)
+        write_run_meta_yaml(actual_run_dir, run_meta)
         write_run_meta_yaml(cfg.checkpoint_dir(), run_meta)
 
     if HAS_WAKEPY:

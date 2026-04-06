@@ -79,6 +79,12 @@ ROI_V3_DEFAULTS = {
     "post_min_area": 0,
     # H) 多级调试
     "debug_levels": False,
+    # I) D20结构判别 + 道路标线抑制
+    "enable_d20_structure_score": False,
+    "d20_structure_thr": 0.45,
+    "enable_lane_marking_suppress": False,
+    "lane_marking_bright_thr": 200,
+    "lane_marking_sat_thr": 45,
 }
 
 
@@ -191,6 +197,160 @@ def postprocess_mask(mask_u8: np.ndarray, open_ksize=0, close_ksize=0, min_area=
         out = keep
 
     return out
+
+
+def _skeletonize_mask(mask_u8: np.ndarray):
+    """
+    轻量骨架化：仅用OpenCV形态学迭代，避免引入额外依赖。
+    """
+    work = ((mask_u8 > 0).astype(np.uint8)) * 255
+    skel = np.zeros_like(work, dtype=np.uint8)
+    element = cv2.getStructuringElement(cv2.MORPH_CROSS, (3, 3))
+
+    # 迭代上限用于防止极端输入导致长循环
+    for _ in range(2048):
+        if cv2.countNonZero(work) == 0:
+            break
+        eroded = cv2.erode(work, element)
+        opened = cv2.dilate(eroded, element)
+        temp = cv2.subtract(work, opened)
+        skel = cv2.bitwise_or(skel, temp)
+        work = eroded
+    return skel
+
+
+def extract_d20_structure_features(roi_mask_u8: np.ndarray):
+    """
+    从ROI二值mask提取D20结构特征（轻量实现）。
+    """
+    bw = (roi_mask_u8 > 0).astype(np.uint8)
+    h, w = bw.shape[:2]
+    roi_area = max(1, int(h * w))
+    mask_pixels = int(np.count_nonzero(bw))
+    crack_area_ratio = float(mask_pixels / roi_area)
+
+    feats = {
+        "crack_area_ratio": crack_area_ratio,
+        "connected_components_count": 0,
+        "largest_component_ratio": 0.0,
+        "skeleton_length": 0,
+        "branch_points_count": 0,
+        "branch_density": 0.0,
+        "orientation_entropy": 0.0,
+        "mask_pixels": mask_pixels,
+    }
+    if mask_pixels == 0:
+        return feats
+
+    num, _, stats, _ = cv2.connectedComponentsWithStats(bw, connectivity=8)
+    comp_areas = stats[1:, cv2.CC_STAT_AREA] if num > 1 else np.empty((0,), dtype=np.int32)
+    cc_count = int(comp_areas.size)
+    largest_ratio = float(comp_areas.max() / max(1, mask_pixels)) if cc_count > 0 else 0.0
+
+    skel = _skeletonize_mask(roi_mask_u8)
+    sk_bin = (skel > 0).astype(np.uint8)
+    skeleton_length = int(np.count_nonzero(sk_bin))
+
+    branch_points = 0
+    if skeleton_length > 0:
+        # 统计8邻域>=3的骨架像素作为分支点
+        kernel = np.array([[1, 1, 1], [1, 0, 1], [1, 1, 1]], dtype=np.int16)
+        nei = cv2.filter2D(sk_bin, cv2.CV_16S, kernel, borderType=cv2.BORDER_CONSTANT)
+        branch_points = int(np.logical_and(sk_bin > 0, nei >= 3).sum())
+    branch_density = float(branch_points / max(1, skeleton_length))
+
+    # 方向熵（简化版）：基于骨架梯度方向的加权直方图熵，归一化到0~1
+    orientation_entropy = 0.0
+    if skeleton_length > 8:
+        sk_f = sk_bin.astype(np.float32)
+        gx = cv2.Sobel(sk_f, cv2.CV_32F, 1, 0, ksize=3)
+        gy = cv2.Sobel(sk_f, cv2.CV_32F, 0, 1, ksize=3)
+        mag = np.sqrt(gx * gx + gy * gy)
+        valid = mag > 1e-6
+        if np.any(valid):
+            angles = np.mod(np.arctan2(gy[valid], gx[valid]), np.pi)
+            hist, _ = np.histogram(angles, bins=12, range=(0.0, np.pi), weights=mag[valid])
+            hsum = float(hist.sum())
+            if hsum > 1e-8:
+                p = hist / hsum
+                p = p[p > 1e-8]
+                orientation_entropy = float((-np.sum(p * np.log(p))) / np.log(12.0))
+
+    feats["connected_components_count"] = cc_count
+    feats["largest_component_ratio"] = largest_ratio
+    feats["skeleton_length"] = skeleton_length
+    feats["branch_points_count"] = branch_points
+    feats["branch_density"] = branch_density
+    feats["orientation_entropy"] = orientation_entropy
+    return feats
+
+
+def score_d20_structure(features: dict):
+    """
+    结构评分：0~1，分数越高越像裂缝网络结构。
+    """
+    area_ratio = float(features.get("crack_area_ratio", 0.0))
+    cc_count = float(features.get("connected_components_count", 0))
+    largest_ratio = float(features.get("largest_component_ratio", 0.0))
+    skeleton_length = float(features.get("skeleton_length", 0))
+    branch_density = float(features.get("branch_density", 0.0))
+    orient_entropy = float(features.get("orientation_entropy", 0.0))
+    mask_pixels = float(max(1, int(features.get("mask_pixels", 1))))
+
+    if area_ratio <= 0.0 or skeleton_length <= 0.0:
+        return 0.0
+
+    # 面积过小给低分，面积过大给惩罚（大块白线/斑马线误检常见）
+    area_support = float(np.clip((area_ratio - 0.001) / 0.035, 0.0, 1.0))
+    area_penalty = float(np.clip((area_ratio - 0.22) / 0.30, 0.0, 1.0))
+    area_score = max(0.0, area_support * (1.0 - 0.6 * area_penalty))
+
+    cc_score = float(np.clip(cc_count / 8.0, 0.0, 1.0))
+    largest_score = float(1.0 - np.clip((largest_ratio - 0.90) / 0.10, 0.0, 1.0))
+
+    # 骨架长度与mask像素比值，反映细长结构占比
+    sk_ratio = skeleton_length / mask_pixels
+    skeleton_score = float(np.clip((sk_ratio - 0.10) / 0.50, 0.0, 1.0))
+
+    branch_score = float(np.clip(branch_density / 0.035, 0.0, 1.0))
+    entropy_score = float(np.clip((orient_entropy - 0.15) / 0.65, 0.0, 1.0))
+
+    score = (
+        0.20 * area_score
+        + 0.15 * cc_score
+        + 0.15 * largest_score
+        + 0.20 * skeleton_score
+        + 0.15 * branch_score
+        + 0.15 * entropy_score
+    )
+    return float(np.clip(score, 0.0, 1.0))
+
+
+def suppress_lane_marking_regions(
+    roi_bgr: np.ndarray,
+    roi_mask_u8: np.ndarray,
+    bright_thr: int = 200,
+    sat_thr: int = 45,
+):
+    """
+    检测疑似白色道路标线区域，返回用于抑制的mask（255=建议抑制）。
+    """
+    if roi_bgr is None or roi_mask_u8 is None:
+        return np.zeros((0, 0), dtype=np.uint8)
+
+    hsv = cv2.cvtColor(roi_bgr, cv2.COLOR_BGR2HSV)
+    _, s, v = cv2.split(hsv)
+
+    lane_like = np.logical_and(v >= int(bright_thr), s <= int(sat_thr)).astype(np.uint8) * 255
+    if cv2.countNonZero(lane_like) == 0:
+        return np.zeros_like(roi_mask_u8, dtype=np.uint8)
+
+    # 轻量形态学，让白线区域更连续稳定
+    k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
+    lane_like = cv2.morphologyEx(lane_like, cv2.MORPH_OPEN, k)
+    lane_like = cv2.morphologyEx(lane_like, cv2.MORPH_CLOSE, k)
+    lane_like = cv2.dilate(lane_like, k, iterations=1)
+    return lane_like
 
 
 def compute_adaptive_tile_params(
@@ -404,6 +564,11 @@ def cascade_one_image_v3c(
     highres_imgsz=1600,
     highres_min_side=1600,
     debug_levels=False,
+    enable_d20_structure_score=False,
+    d20_structure_thr=0.45,
+    enable_lane_marking_suppress=False,
+    lane_marking_bright_thr=200,
+    lane_marking_sat_thr=45,
 ):
     H, W = img_bgr.shape[:2]
     full_mask = np.zeros((H, W), dtype=np.uint8)
@@ -580,8 +745,60 @@ def cascade_one_image_v3c(
                 min_area=post_min_area,
             )
 
+        # D20/大病害结构判别：放在后处理之后、写回full_mask之前
+        low_structure_score = False
+        lane_suppress_applied = False
+        lane_overlap_ratio = 0.0
+        d20_structure_score = 1.0
+        d20_feats = None
+        is_structure_target = (det_class == int(d20_class_id))
+        if enable_d20_structure_score and is_structure_target:
+            d20_feats = extract_d20_structure_features(roi_mask)
+            d20_structure_score = score_d20_structure(d20_feats)
+            low_structure_score = d20_structure_score < float(d20_structure_thr)
+
+            # 低结构分时，不删整块ROI；仅在疑似白线区域做局部抑制
+            if low_structure_score and enable_lane_marking_suppress:
+                lane_sup_mask = suppress_lane_marking_regions(
+                    roi,
+                    roi_mask,
+                    bright_thr=lane_marking_bright_thr,
+                    sat_thr=lane_marking_sat_thr,
+                )
+                if lane_sup_mask.shape[:2] == roi_mask.shape[:2]:
+                    overlap_px = int(np.logical_and(roi_mask > 0, lane_sup_mask > 0).sum())
+                    mask_px = int(np.count_nonzero(roi_mask))
+                    lane_overlap_ratio = float(overlap_px / max(1, mask_px))
+                    if overlap_px > 0:
+                        keep_mask = np.where(lane_sup_mask > 0, 0, 255).astype(np.uint8)
+                        before_px = mask_px
+                        roi_mask = cv2.bitwise_and(roi_mask, keep_mask)
+                        after_px = int(np.count_nonzero(roi_mask))
+                        lane_suppress_applied = after_px < before_px
+
         if debug_dir is not None:
             roi_ov = overlay_mask_red(roi, roi_mask, alpha=0.55)
+            if low_structure_score:
+                cv2.putText(
+                    roi_ov,
+                    f"low-structure-score:{d20_structure_score:.2f}",
+                    (8, 22),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    0.55,
+                    (0, 165, 255),
+                    2,
+                )
+                if lane_suppress_applied:
+                    cv2.putText(
+                        roi_ov,
+                        f"lane-suppress overlap:{lane_overlap_ratio:.2f}",
+                        (8, 44),
+                        cv2.FONT_HERSHEY_SIMPLEX,
+                        0.50,
+                        (0, 255, 255),
+                        1,
+                    )
+
             if debug_levels:
                 cv2.imwrite(
                     str(debug_dir / "05_fused_masks" / f"{debug_prefix}__c{det_class}__roi_{roi_id:03d}_{x1}_{y1}_{x2}_{y2}__overlay.jpg"),
@@ -591,8 +808,22 @@ def cascade_one_image_v3c(
                     str(debug_dir / "05_fused_masks" / f"{debug_prefix}__c{det_class}__roi_{roi_id:03d}_{x1}_{y1}_{x2}_{y2}__mask.png"),
                     roi_mask,
                 )
+                if low_structure_score and d20_feats is not None:
+                    info_file = debug_dir / "05_fused_masks" / f"{debug_prefix}__c{det_class}__roi_{roi_id:03d}_{x1}_{y1}_{x2}_{y2}__structure.txt"
+                    with open(info_file, "w", encoding="utf-8") as df:
+                        df.write(f"low_structure_score=1, score={d20_structure_score:.4f}, thr={float(d20_structure_thr):.4f}\n")
+                        df.write(f"lane_suppress_applied={lane_suppress_applied}, lane_overlap_ratio={lane_overlap_ratio:.4f}\n")
+                        for k, v in d20_feats.items():
+                            df.write(f"{k}={v}\n")
             else:
                 cv2.imwrite(str(debug_dir / f"{debug_prefix}__c{det_class}__roi_{roi_id:03d}_{x1}_{y1}_{x2}_{y2}__overlay.jpg"), roi_ov)
+                if low_structure_score and d20_feats is not None:
+                    info_file = debug_dir / f"{debug_prefix}__c{det_class}__roi_{roi_id:03d}_{x1}_{y1}_{x2}_{y2}__structure.txt"
+                    with open(info_file, "w", encoding="utf-8") as df:
+                        df.write(f"low_structure_score=1, score={d20_structure_score:.4f}, thr={float(d20_structure_thr):.4f}\n")
+                        df.write(f"lane_suppress_applied={lane_suppress_applied}, lane_overlap_ratio={lane_overlap_ratio:.4f}\n")
+                        for k, v in d20_feats.items():
+                            df.write(f"{k}={v}\n")
 
         full_mask[y1:y2, x1:x2] = np.maximum(full_mask[y1:y2, x1:x2], roi_mask)
 
@@ -696,6 +927,16 @@ def main():
     ap.add_argument("--highres-min-side", type=int, default=ROI_V3_DEFAULTS["highres_min_side"])
     ap.add_argument("--debug-levels", action="store_true",
                     help="输出多级debug结果：原框/扩框/tile/局部mask/融合mask")
+    ap.add_argument("--enable-d20-structure-score", action="store_true",
+                    help="启用D20/大病害ROI结构判别（后处理后生效）")
+    ap.add_argument("--d20-structure-thr", type=float, default=ROI_V3_DEFAULTS["d20_structure_thr"],
+                    help="D20结构判别阈值，低于该分数触发保守策略")
+    ap.add_argument("--enable-lane-marking-suppress", action="store_true",
+                    help="低结构分时启用疑似白色道路标线区域抑制")
+    ap.add_argument("--lane-marking-bright-thr", type=int, default=ROI_V3_DEFAULTS["lane_marking_bright_thr"],
+                    help="道路标线抑制：HSV-V亮度阈值")
+    ap.add_argument("--lane-marking-sat-thr", type=int, default=ROI_V3_DEFAULTS["lane_marking_sat_thr"],
+                    help="道路标线抑制：HSV-S饱和度阈值（低饱和更像白线）")
 
     # Debug
     ap.add_argument("--debug-rois", action="store_true")
@@ -781,6 +1022,9 @@ def main():
         f.write(f"adaptive_tile={args.adaptive_tile}, adaptive_min_tile={args.adaptive_min_tile}, adaptive_max_tile={args.adaptive_max_tile}, adaptive_target_long_tiles={args.adaptive_target_long_tiles}\n")
         f.write(f"tile_overlap_ratio={args.tile_overlap_ratio}, tile_fusion={args.tile_fusion}, tile_fusion_thr={args.tile_fusion_thr}\n")
         f.write(f"highres_seg={args.highres_seg}, highres_imgsz={args.highres_imgsz}, highres_min_side={args.highres_min_side}\n")
+        f.write("\n[D20 Structure]\n")
+        f.write(f"enable_d20_structure_score={args.enable_d20_structure_score}, d20_structure_thr={args.d20_structure_thr}\n")
+        f.write(f"enable_lane_marking_suppress={args.enable_lane_marking_suppress}, lane_marking_bright_thr={args.lane_marking_bright_thr}, lane_marking_sat_thr={args.lane_marking_sat_thr}\n")
         f.write("\n[Postprocess]\n")
         f.write(f"post_open={args.post_open}, post_close={args.post_close}, post_min_area={args.post_min_area}\n")
         f.write("\n[Debug]\n")
@@ -879,6 +1123,11 @@ def main():
             highres_imgsz=args.highres_imgsz,
             highres_min_side=args.highres_min_side,
             debug_levels=args.debug_levels,
+            enable_d20_structure_score=args.enable_d20_structure_score,
+            d20_structure_thr=args.d20_structure_thr,
+            enable_lane_marking_suppress=args.enable_lane_marking_suppress,
+            lane_marking_bright_thr=args.lane_marking_bright_thr,
+            lane_marking_sat_thr=args.lane_marking_sat_thr,
         )
 
         det_vis = draw_det_boxes(img, det_res, det_names, conf_thr=args.det_conf)

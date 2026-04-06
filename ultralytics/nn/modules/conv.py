@@ -15,6 +15,7 @@ __all__ = (
     "Concat",
     "Conv",
     "Conv2",
+    "CoordAtt",
     "ConvTranspose",
     "DWConv",
     "DWConvTranspose2d",
@@ -611,6 +612,46 @@ class CBAM(nn.Module):
             (torch.Tensor): Attended output tensor.
         """
         return self.spatial_attention(self.channel_attention(x))
+
+
+class CoordAtt(nn.Module):
+    """Lightweight Coordinate Attention module.
+
+    References:
+        https://arxiv.org/abs/2103.02907
+    """
+
+    def __init__(self, c1, c2, reduction=32):
+        """Initialize CoordAtt.
+
+        Args:
+            c1 (int): Input channels.
+            c2 (int): Output channels.
+            reduction (int): Channel reduction ratio.
+        """
+        super().__init__()
+        mip = max(8, c1 // reduction)
+        self.conv1 = nn.Conv2d(c1, mip, 1, 1, 0, bias=False)
+        self.bn1 = nn.BatchNorm2d(mip)
+        self.act = nn.Hardswish()
+        self.conv_h = nn.Conv2d(mip, c2, 1, 1, 0, bias=True)
+        self.conv_w = nn.Conv2d(mip, c2, 1, 1, 0, bias=True)
+        self.proj = nn.Identity() if c1 == c2 else nn.Conv2d(c1, c2, 1, 1, 0, bias=False)
+
+    def forward(self, x):
+        """Apply coordinate attention."""
+        identity = self.proj(x)
+        _, _, h, w = x.shape
+        x_h = torch.mean(x, dim=3, keepdim=True)  # (B, C, H, 1)
+        x_w = torch.mean(x, dim=2, keepdim=True).permute(0, 1, 3, 2)  # (B, C, W, 1)
+
+        y = self.act(self.bn1(self.conv1(torch.cat((x_h, x_w), dim=2))))
+        x_h, x_w = torch.split(y, [h, w], dim=2)
+        x_w = x_w.permute(0, 1, 3, 2)
+
+        a_h = torch.sigmoid(self.conv_h(x_h))
+        a_w = torch.sigmoid(self.conv_w(x_w))
+        return identity * a_h * a_w
 
 
 class Concat(nn.Module):

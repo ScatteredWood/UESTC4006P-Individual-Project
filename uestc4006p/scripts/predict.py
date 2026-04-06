@@ -6,15 +6,15 @@ def main():
     # 命名模式：new=新短命名，legacy=旧命名回退
     name_mode = "new"
 
-    best_pt = r"E:\repositories\ultralytics\uestc4006p\runs\seg_CSC_2649_yolov8n-seg_800_ep200_bs24_seed42_ftbest__mask2poly-v2__open1close1__eps0p001__max500\weights\best.pt"
-    source = r"E:\Large Files\UESTC4006P Individual Project (2025-26)\datasets\public\seg_test"  # 0=默认摄像头；也可以换成图片/文件夹/视频路径
+    best_pt = r"E:\repositories\ultralytics\uestc4006p\runs\train_seg_seg6678_all_v8mseg_train_12\weights\best.pt"
+    source = r"E:\Large Files\UESTC4006P Individual Project (2025-26)\test\seg_test"  # 0=默认摄像头；也可以换成图片/文件夹/视频路径
 
     cfg = ExpCfg(
         dataset="seg_test",
         task="segmentation",
         model_family="yolov8",
-        model_name="yolov8n.pt",
-        exp_name="baseline",
+        model_name="yolov8m.pt",
+        exp_name="train_1",
         tag="",  # tag可选；为空时目录名不追加tag
         naming_mode=name_mode,
     )
