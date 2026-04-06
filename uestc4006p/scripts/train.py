@@ -257,6 +257,8 @@ class ExpCfg:
 
     patience: int
     cache: object  # bool | str
+    overlap_mask: bool
+    mask_ratio: int
 
     dataset_name: str = ""
     domain: str = ""
@@ -379,6 +381,9 @@ def main():
     ap.add_argument("--workers", type=int, default=DEFAULT_WORKERS)
     ap.add_argument("--seed", type=int, default=DEFAULT_SEED)
     ap.add_argument("--patience", type=int, default=DEFAULT_PATIENCE)
+    # segmentation 相关参数：P2 结构可显式覆盖默认配置
+    ap.add_argument("--overlap-mask", action=argparse.BooleanOptionalAction, default=True)
+    ap.add_argument("--mask-ratio", type=int, default=4)
 
     # cache 参数
     ap.add_argument("--cache", default=DEFAULT_CACHE)
@@ -410,6 +415,8 @@ def main():
         seed=args.seed,
         patience=args.patience,
         cache=normalize_cache_arg(args.cache),
+        overlap_mask=args.overlap_mask,
+        mask_ratio=args.mask_ratio,
         dataset_name=args.dataset_name,
         domain=args.domain,
         model_alias=args.model_alias,
@@ -477,6 +484,8 @@ def main():
             seed=cfg.seed,
             patience=cfg.patience,
             cache=cfg.cache,
+            overlap_mask=cfg.overlap_mask,
+            mask_ratio=cfg.mask_ratio,
             resume=is_resume,
             exist_ok=cfg.exist_ok,
             project=str(run_project),
