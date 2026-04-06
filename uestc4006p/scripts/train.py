@@ -164,6 +164,14 @@ def resolve_model_path(model_arg: str) -> Path:
     return (REPO_ROOT / p).resolve()
 
 
+def resolve_pretrained_path(pretrained_arg: str) -> Path | None:
+    """解析可选 warm start 权重路径；空值返回 None。"""
+    s = str(pretrained_arg).strip()
+    if not s:
+        return None
+    return resolve_model_path(s)
+
+
 def normalize_cache_arg(v):
     """
     支持：
@@ -255,6 +263,7 @@ class ExpCfg:
     model_alias: str = ""
     tag: str = ""
     note: str = ""
+    pretrained: Path | None = None
 
     runs_root: Path = DEFAULT_RUNS_ROOT
     checkpoint_root: Path = DEFAULT_CHECKPOINT_ROOT
@@ -360,6 +369,7 @@ def main():
     ap.add_argument("--task", required=True, choices=["detect", "segment"])
     ap.add_argument("--data", required=True)
     ap.add_argument("--model", required=True)
+    ap.add_argument("--pretrained", default="", help="可选 warm start 权重；主要用于 --model 为 yaml 时先建模再加载")
 
     # 超参数
     ap.add_argument("--imgsz", type=int, default=DEFAULT_IMGSZ)
@@ -405,6 +415,7 @@ def main():
         model_alias=args.model_alias,
         tag=args.tag,
         note=args.note,
+        pretrained=resolve_pretrained_path(args.pretrained),
         runs_root=Path(args.runs_root).resolve(),
         checkpoint_root=Path(args.checkpoint_root).resolve(),
         exist_ok=args.exist_ok,
@@ -438,6 +449,16 @@ def main():
     print("======================================================")
 
     model = YOLO(str(cfg.model))
+    if cfg.pretrained:
+        # resume 优先，避免与断点续训语义冲突
+        if cfg.is_resume_mode():
+            print(f"[INFO] 检测到 resume 模式，忽略 --pretrained: {cfg.pretrained}")
+        elif cfg.model.suffix.lower() == ".pt":
+            # --model 已是权重文件时，再传 --pretrained 存在语义歧义，安全起见忽略
+            print(f"[INFO] 检测到 --model 为 .pt，忽略 --pretrained 以避免歧义: {cfg.pretrained}")
+        else:
+            print(f"[INFO] 使用 warm start 权重: {cfg.pretrained}")
+            model.load(str(cfg.pretrained))
 
     def start_training():
         is_resume = cfg.is_resume_mode()
