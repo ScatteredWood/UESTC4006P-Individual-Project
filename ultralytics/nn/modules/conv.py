@@ -16,6 +16,7 @@ __all__ = (
     "Conv",
     "Conv2",
     "CoordAtt",
+    "EMA",
     "ConvTranspose",
     "DWConv",
     "DWConvTranspose2d",
@@ -652,6 +653,54 @@ class CoordAtt(nn.Module):
         a_h = torch.sigmoid(self.conv_h(x_h))
         a_w = torch.sigmoid(self.conv_w(x_w))
         return identity * a_h * a_w
+
+
+class EMA(nn.Module):
+    """Efficient Multi-scale Attention module."""
+
+    def __init__(self, c1, c2, factor=8):
+        """Initialize EMA attention.
+
+        Args:
+            c1 (int): Input channels.
+            c2 (int): Output channels.
+            factor (int): Grouping factor used by EMA.
+        """
+        super().__init__()
+        self.proj = nn.Identity() if c1 == c2 else nn.Conv2d(c1, c2, 1, 1, 0, bias=False)
+
+        groups = min(max(1, int(factor)), c2)
+        while c2 % groups != 0 and groups > 1:
+            groups -= 1
+        self.groups = groups
+        gc = c2 // self.groups
+
+        self.conv1x1 = nn.Conv2d(gc, gc, 1, 1, 0, bias=False)
+        self.conv3x3 = nn.Conv2d(gc, gc, 3, 1, 1, bias=False)
+        self.gn = nn.GroupNorm(gc, gc)
+        self.pool = nn.AdaptiveAvgPool2d(1)
+        self.softmax = nn.Softmax(dim=-1)
+
+    def forward(self, x):
+        """Apply EMA attention."""
+        x = self.proj(x)
+        b, c, h, w = x.shape
+        gx = x.reshape(b * self.groups, c // self.groups, h, w)
+
+        x_h = gx.mean(dim=3, keepdim=True)
+        x_w = gx.mean(dim=2, keepdim=True).permute(0, 1, 3, 2)
+        hw = self.conv1x1(torch.cat((x_h, x_w), dim=2))
+        x_h, x_w = torch.split(hw, [h, w], dim=2)
+        x1 = self.gn(gx * x_h.sigmoid() * x_w.permute(0, 1, 3, 2).sigmoid())
+        x2 = self.conv3x3(gx)
+
+        x11 = self.softmax(self.pool(x1).reshape(b * self.groups, -1, 1).transpose(1, 2))
+        x12 = x2.reshape(b * self.groups, c // self.groups, -1)
+        x21 = self.softmax(self.pool(x2).reshape(b * self.groups, -1, 1).transpose(1, 2))
+        x22 = x1.reshape(b * self.groups, c // self.groups, -1)
+        weights = (torch.matmul(x11, x12) + torch.matmul(x21, x22)).reshape(b * self.groups, 1, h, w)
+
+        return (gx * weights.sigmoid()).reshape(b, c, h, w)
 
 
 class Concat(nn.Module):
