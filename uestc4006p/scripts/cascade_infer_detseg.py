@@ -23,6 +23,7 @@ v3c 核心增强（适合中期展示）：
 # 级联推理v3c：Det出框→ROI裁剪/超大ROI滑窗切块→Seg分割→拼回整图；支持D20/D40类策略(更强tile/更松阈值/可选CLAHE)；输出mask/overlay/RUN_INFO与debug_rois
 
 import argparse
+import time
 from pathlib import Path
 import cv2
 import numpy as np
@@ -75,10 +76,16 @@ ROI_V3_DEFAULTS = {
     "clahe_grid": 8,
     # G) 轻量后处理
     "post_open": 0,
-    "post_close": 0,
-    "post_min_area": 0,
+    "post_close": 3,
+    "post_min_area": 25,
     # H) 多级调试
     "debug_levels": False,
+    # I) D20结构判别 + 道路标线抑制
+    "enable_d20_structure_score": False,
+    "d20_structure_thr": 0.45,
+    "enable_lane_marking_suppress": False,
+    "lane_marking_bright_thr": 200,
+    "lane_marking_sat_thr": 45,
 }
 
 
@@ -191,6 +198,160 @@ def postprocess_mask(mask_u8: np.ndarray, open_ksize=0, close_ksize=0, min_area=
         out = keep
 
     return out
+
+
+def _skeletonize_mask(mask_u8: np.ndarray):
+    """
+    轻量骨架化：仅用OpenCV形态学迭代，避免引入额外依赖。
+    """
+    work = ((mask_u8 > 0).astype(np.uint8)) * 255
+    skel = np.zeros_like(work, dtype=np.uint8)
+    element = cv2.getStructuringElement(cv2.MORPH_CROSS, (3, 3))
+
+    # 迭代上限用于防止极端输入导致长循环
+    for _ in range(2048):
+        if cv2.countNonZero(work) == 0:
+            break
+        eroded = cv2.erode(work, element)
+        opened = cv2.dilate(eroded, element)
+        temp = cv2.subtract(work, opened)
+        skel = cv2.bitwise_or(skel, temp)
+        work = eroded
+    return skel
+
+
+def extract_d20_structure_features(roi_mask_u8: np.ndarray):
+    """
+    从ROI二值mask提取D20结构特征（轻量实现）。
+    """
+    bw = (roi_mask_u8 > 0).astype(np.uint8)
+    h, w = bw.shape[:2]
+    roi_area = max(1, int(h * w))
+    mask_pixels = int(np.count_nonzero(bw))
+    crack_area_ratio = float(mask_pixels / roi_area)
+
+    feats = {
+        "crack_area_ratio": crack_area_ratio,
+        "connected_components_count": 0,
+        "largest_component_ratio": 0.0,
+        "skeleton_length": 0,
+        "branch_points_count": 0,
+        "branch_density": 0.0,
+        "orientation_entropy": 0.0,
+        "mask_pixels": mask_pixels,
+    }
+    if mask_pixels == 0:
+        return feats
+
+    num, _, stats, _ = cv2.connectedComponentsWithStats(bw, connectivity=8)
+    comp_areas = stats[1:, cv2.CC_STAT_AREA] if num > 1 else np.empty((0,), dtype=np.int32)
+    cc_count = int(comp_areas.size)
+    largest_ratio = float(comp_areas.max() / max(1, mask_pixels)) if cc_count > 0 else 0.0
+
+    skel = _skeletonize_mask(roi_mask_u8)
+    sk_bin = (skel > 0).astype(np.uint8)
+    skeleton_length = int(np.count_nonzero(sk_bin))
+
+    branch_points = 0
+    if skeleton_length > 0:
+        # 统计8邻域>=3的骨架像素作为分支点
+        kernel = np.array([[1, 1, 1], [1, 0, 1], [1, 1, 1]], dtype=np.int16)
+        nei = cv2.filter2D(sk_bin, cv2.CV_16S, kernel, borderType=cv2.BORDER_CONSTANT)
+        branch_points = int(np.logical_and(sk_bin > 0, nei >= 3).sum())
+    branch_density = float(branch_points / max(1, skeleton_length))
+
+    # 方向熵（简化版）：基于骨架梯度方向的加权直方图熵，归一化到0~1
+    orientation_entropy = 0.0
+    if skeleton_length > 8:
+        sk_f = sk_bin.astype(np.float32)
+        gx = cv2.Sobel(sk_f, cv2.CV_32F, 1, 0, ksize=3)
+        gy = cv2.Sobel(sk_f, cv2.CV_32F, 0, 1, ksize=3)
+        mag = np.sqrt(gx * gx + gy * gy)
+        valid = mag > 1e-6
+        if np.any(valid):
+            angles = np.mod(np.arctan2(gy[valid], gx[valid]), np.pi)
+            hist, _ = np.histogram(angles, bins=12, range=(0.0, np.pi), weights=mag[valid])
+            hsum = float(hist.sum())
+            if hsum > 1e-8:
+                p = hist / hsum
+                p = p[p > 1e-8]
+                orientation_entropy = float((-np.sum(p * np.log(p))) / np.log(12.0))
+
+    feats["connected_components_count"] = cc_count
+    feats["largest_component_ratio"] = largest_ratio
+    feats["skeleton_length"] = skeleton_length
+    feats["branch_points_count"] = branch_points
+    feats["branch_density"] = branch_density
+    feats["orientation_entropy"] = orientation_entropy
+    return feats
+
+
+def score_d20_structure(features: dict):
+    """
+    结构评分：0~1，分数越高越像裂缝网络结构。
+    """
+    area_ratio = float(features.get("crack_area_ratio", 0.0))
+    cc_count = float(features.get("connected_components_count", 0))
+    largest_ratio = float(features.get("largest_component_ratio", 0.0))
+    skeleton_length = float(features.get("skeleton_length", 0))
+    branch_density = float(features.get("branch_density", 0.0))
+    orient_entropy = float(features.get("orientation_entropy", 0.0))
+    mask_pixels = float(max(1, int(features.get("mask_pixels", 1))))
+
+    if area_ratio <= 0.0 or skeleton_length <= 0.0:
+        return 0.0
+
+    # 面积过小给低分，面积过大给惩罚（大块白线/斑马线误检常见）
+    area_support = float(np.clip((area_ratio - 0.001) / 0.035, 0.0, 1.0))
+    area_penalty = float(np.clip((area_ratio - 0.22) / 0.30, 0.0, 1.0))
+    area_score = max(0.0, area_support * (1.0 - 0.6 * area_penalty))
+
+    cc_score = float(np.clip(cc_count / 8.0, 0.0, 1.0))
+    largest_score = float(1.0 - np.clip((largest_ratio - 0.90) / 0.10, 0.0, 1.0))
+
+    # 骨架长度与mask像素比值，反映细长结构占比
+    sk_ratio = skeleton_length / mask_pixels
+    skeleton_score = float(np.clip((sk_ratio - 0.10) / 0.50, 0.0, 1.0))
+
+    branch_score = float(np.clip(branch_density / 0.035, 0.0, 1.0))
+    entropy_score = float(np.clip((orient_entropy - 0.15) / 0.65, 0.0, 1.0))
+
+    score = (
+        0.20 * area_score
+        + 0.15 * cc_score
+        + 0.15 * largest_score
+        + 0.20 * skeleton_score
+        + 0.15 * branch_score
+        + 0.15 * entropy_score
+    )
+    return float(np.clip(score, 0.0, 1.0))
+
+
+def suppress_lane_marking_regions(
+    roi_bgr: np.ndarray,
+    roi_mask_u8: np.ndarray,
+    bright_thr: int = 200,
+    sat_thr: int = 45,
+):
+    """
+    检测疑似白色道路标线区域，返回用于抑制的mask（255=建议抑制）。
+    """
+    if roi_bgr is None or roi_mask_u8 is None:
+        return np.zeros((0, 0), dtype=np.uint8)
+
+    hsv = cv2.cvtColor(roi_bgr, cv2.COLOR_BGR2HSV)
+    _, s, v = cv2.split(hsv)
+
+    lane_like = np.logical_and(v >= int(bright_thr), s <= int(sat_thr)).astype(np.uint8) * 255
+    if cv2.countNonZero(lane_like) == 0:
+        return np.zeros_like(roi_mask_u8, dtype=np.uint8)
+
+    # 轻量形态学，让白线区域更连续稳定
+    k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
+    lane_like = cv2.morphologyEx(lane_like, cv2.MORPH_OPEN, k)
+    lane_like = cv2.morphologyEx(lane_like, cv2.MORPH_CLOSE, k)
+    lane_like = cv2.dilate(lane_like, k, iterations=1)
+    return lane_like
 
 
 def compute_adaptive_tile_params(
@@ -404,6 +565,11 @@ def cascade_one_image_v3c(
     highres_imgsz=1600,
     highres_min_side=1600,
     debug_levels=False,
+    enable_d20_structure_score=False,
+    d20_structure_thr=0.45,
+    enable_lane_marking_suppress=False,
+    lane_marking_bright_thr=200,
+    lane_marking_sat_thr=45,
 ):
     H, W = img_bgr.shape[:2]
     full_mask = np.zeros((H, W), dtype=np.uint8)
@@ -580,8 +746,60 @@ def cascade_one_image_v3c(
                 min_area=post_min_area,
             )
 
+        # D20/大病害结构判别：放在后处理之后、写回full_mask之前
+        low_structure_score = False
+        lane_suppress_applied = False
+        lane_overlap_ratio = 0.0
+        d20_structure_score = 1.0
+        d20_feats = None
+        is_structure_target = (det_class == int(d20_class_id))
+        if enable_d20_structure_score and is_structure_target:
+            d20_feats = extract_d20_structure_features(roi_mask)
+            d20_structure_score = score_d20_structure(d20_feats)
+            low_structure_score = d20_structure_score < float(d20_structure_thr)
+
+            # 低结构分时，不删整块ROI；仅在疑似白线区域做局部抑制
+            if low_structure_score and enable_lane_marking_suppress:
+                lane_sup_mask = suppress_lane_marking_regions(
+                    roi,
+                    roi_mask,
+                    bright_thr=lane_marking_bright_thr,
+                    sat_thr=lane_marking_sat_thr,
+                )
+                if lane_sup_mask.shape[:2] == roi_mask.shape[:2]:
+                    overlap_px = int(np.logical_and(roi_mask > 0, lane_sup_mask > 0).sum())
+                    mask_px = int(np.count_nonzero(roi_mask))
+                    lane_overlap_ratio = float(overlap_px / max(1, mask_px))
+                    if overlap_px > 0:
+                        keep_mask = np.where(lane_sup_mask > 0, 0, 255).astype(np.uint8)
+                        before_px = mask_px
+                        roi_mask = cv2.bitwise_and(roi_mask, keep_mask)
+                        after_px = int(np.count_nonzero(roi_mask))
+                        lane_suppress_applied = after_px < before_px
+
         if debug_dir is not None:
             roi_ov = overlay_mask_red(roi, roi_mask, alpha=0.55)
+            if low_structure_score:
+                cv2.putText(
+                    roi_ov,
+                    f"low-structure-score:{d20_structure_score:.2f}",
+                    (8, 22),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    0.55,
+                    (0, 165, 255),
+                    2,
+                )
+                if lane_suppress_applied:
+                    cv2.putText(
+                        roi_ov,
+                        f"lane-suppress overlap:{lane_overlap_ratio:.2f}",
+                        (8, 44),
+                        cv2.FONT_HERSHEY_SIMPLEX,
+                        0.50,
+                        (0, 255, 255),
+                        1,
+                    )
+
             if debug_levels:
                 cv2.imwrite(
                     str(debug_dir / "05_fused_masks" / f"{debug_prefix}__c{det_class}__roi_{roi_id:03d}_{x1}_{y1}_{x2}_{y2}__overlay.jpg"),
@@ -591,8 +809,22 @@ def cascade_one_image_v3c(
                     str(debug_dir / "05_fused_masks" / f"{debug_prefix}__c{det_class}__roi_{roi_id:03d}_{x1}_{y1}_{x2}_{y2}__mask.png"),
                     roi_mask,
                 )
+                if low_structure_score and d20_feats is not None:
+                    info_file = debug_dir / "05_fused_masks" / f"{debug_prefix}__c{det_class}__roi_{roi_id:03d}_{x1}_{y1}_{x2}_{y2}__structure.txt"
+                    with open(info_file, "w", encoding="utf-8") as df:
+                        df.write(f"low_structure_score=1, score={d20_structure_score:.4f}, thr={float(d20_structure_thr):.4f}\n")
+                        df.write(f"lane_suppress_applied={lane_suppress_applied}, lane_overlap_ratio={lane_overlap_ratio:.4f}\n")
+                        for k, v in d20_feats.items():
+                            df.write(f"{k}={v}\n")
             else:
                 cv2.imwrite(str(debug_dir / f"{debug_prefix}__c{det_class}__roi_{roi_id:03d}_{x1}_{y1}_{x2}_{y2}__overlay.jpg"), roi_ov)
+                if low_structure_score and d20_feats is not None:
+                    info_file = debug_dir / f"{debug_prefix}__c{det_class}__roi_{roi_id:03d}_{x1}_{y1}_{x2}_{y2}__structure.txt"
+                    with open(info_file, "w", encoding="utf-8") as df:
+                        df.write(f"low_structure_score=1, score={d20_structure_score:.4f}, thr={float(d20_structure_thr):.4f}\n")
+                        df.write(f"lane_suppress_applied={lane_suppress_applied}, lane_overlap_ratio={lane_overlap_ratio:.4f}\n")
+                        for k, v in d20_feats.items():
+                            df.write(f"{k}={v}\n")
 
         full_mask[y1:y2, x1:x2] = np.maximum(full_mask[y1:y2, x1:x2], roi_mask)
 
@@ -612,7 +844,7 @@ def short_tag_from_ckpt_parent(parent_name: str, fallback: str) -> str:
         core = "_".join(parts[:5])
     return core if core else fallback
 
-def main():
+def _legacy_main_deprecated():
     ap = argparse.ArgumentParser()
 
     ap.add_argument("--det", required=True, help="path to det best.pt")
@@ -696,6 +928,16 @@ def main():
     ap.add_argument("--highres-min-side", type=int, default=ROI_V3_DEFAULTS["highres_min_side"])
     ap.add_argument("--debug-levels", action="store_true",
                     help="输出多级debug结果：原框/扩框/tile/局部mask/融合mask")
+    ap.add_argument("--enable-d20-structure-score", action="store_true",
+                    help="启用D20/大病害ROI结构判别（后处理后生效）")
+    ap.add_argument("--d20-structure-thr", type=float, default=ROI_V3_DEFAULTS["d20_structure_thr"],
+                    help="D20结构判别阈值，低于该分数触发保守策略")
+    ap.add_argument("--enable-lane-marking-suppress", action="store_true",
+                    help="低结构分时启用疑似白色道路标线区域抑制")
+    ap.add_argument("--lane-marking-bright-thr", type=int, default=ROI_V3_DEFAULTS["lane_marking_bright_thr"],
+                    help="道路标线抑制：HSV-V亮度阈值")
+    ap.add_argument("--lane-marking-sat-thr", type=int, default=ROI_V3_DEFAULTS["lane_marking_sat_thr"],
+                    help="道路标线抑制：HSV-S饱和度阈值（低饱和更像白线）")
 
     # Debug
     ap.add_argument("--debug-rois", action="store_true")
@@ -781,6 +1023,9 @@ def main():
         f.write(f"adaptive_tile={args.adaptive_tile}, adaptive_min_tile={args.adaptive_min_tile}, adaptive_max_tile={args.adaptive_max_tile}, adaptive_target_long_tiles={args.adaptive_target_long_tiles}\n")
         f.write(f"tile_overlap_ratio={args.tile_overlap_ratio}, tile_fusion={args.tile_fusion}, tile_fusion_thr={args.tile_fusion_thr}\n")
         f.write(f"highres_seg={args.highres_seg}, highres_imgsz={args.highres_imgsz}, highres_min_side={args.highres_min_side}\n")
+        f.write("\n[D20 Structure]\n")
+        f.write(f"enable_d20_structure_score={args.enable_d20_structure_score}, d20_structure_thr={args.d20_structure_thr}\n")
+        f.write(f"enable_lane_marking_suppress={args.enable_lane_marking_suppress}, lane_marking_bright_thr={args.lane_marking_bright_thr}, lane_marking_sat_thr={args.lane_marking_sat_thr}\n")
         f.write("\n[Postprocess]\n")
         f.write(f"post_open={args.post_open}, post_close={args.post_close}, post_min_area={args.post_min_area}\n")
         f.write("\n[Debug]\n")
@@ -879,6 +1124,11 @@ def main():
             highres_imgsz=args.highres_imgsz,
             highres_min_side=args.highres_min_side,
             debug_levels=args.debug_levels,
+            enable_d20_structure_score=args.enable_d20_structure_score,
+            d20_structure_thr=args.d20_structure_thr,
+            enable_lane_marking_suppress=args.enable_lane_marking_suppress,
+            lane_marking_bright_thr=args.lane_marking_bright_thr,
+            lane_marking_sat_thr=args.lane_marking_sat_thr,
         )
 
         det_vis = draw_det_boxes(img, det_res, det_names, conf_thr=args.det_conf)
@@ -899,6 +1149,515 @@ def main():
                 f"  run_dir={run_dir}"
             )
 
+        print(f"[OK] {p.name} -> saved")
+
+    print("DONE.")
+
+
+IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".bmp", ".tif", ".tiff"}
+VIDEO_EXTS = {".mp4", ".avi", ".mov"}
+
+
+def infer_source_kind(src: Path) -> str:
+    if not src.exists():
+        raise FileNotFoundError(f"Source not found: {src}")
+    if src.is_dir():
+        return "image_dir"
+    ext = src.suffix.lower()
+    if ext in VIDEO_EXTS:
+        return "video_file"
+    if ext in IMAGE_EXTS:
+        return "image_file"
+    probe = cv2.imread(str(src))
+    if probe is not None:
+        return "image_file"
+    raise ValueError(f"Unsupported source type: {src} (expect image file, image dir, or video file)")
+
+
+def collect_images(src: Path) -> list[Path]:
+    if src.is_dir():
+        return sorted([p for p in src.iterdir() if p.is_file() and p.suffix.lower() in IMAGE_EXTS])
+    return [src]
+
+
+def apply_final_mask_postprocess(mask_u8: np.ndarray, post_open: int, post_close: int, post_min_area: int):
+    if post_open or post_close or post_min_area:
+        return postprocess_mask(mask_u8, open_ksize=post_open, close_ksize=post_close, min_area=post_min_area)
+    return mask_u8
+
+
+def cascade_predict_one(
+    img_bgr: np.ndarray,
+    det_model: YOLO,
+    seg_model: YOLO,
+    args,
+    debug_dir: Path = None,
+    debug_prefix: str = "",
+):
+    full_mask, det_res = cascade_one_image_v3c(
+        img_bgr,
+        det_model,
+        seg_model,
+        det_conf=args.det_conf,
+        det_iou=args.det_iou,
+        det_imgsz=args.det_imgsz,
+        seg_conf=args.seg_conf,
+        seg_thr=args.seg_thr,
+        seg_imgsz=args.seg_imgsz,
+        seg_iou=args.seg_iou,
+        pad_ratio=args.pad_ratio,
+        pad_min=args.pad_min,
+        max_rois=args.max_rois,
+        allowed_det_classes=args.det_classes,
+        max_area_ratio=args.max_area_ratio,
+        tile_min_side=args.tile_min_side,
+        tile=args.tile,
+        overlap=args.overlap,
+        use_tile_for_big_roi=(not args.no_tile),
+        big_damage_class_ids=tuple(int(x) for x in args.big_classes),
+        big_seg_conf=args.big_seg_conf,
+        big_seg_thr=args.big_seg_thr,
+        big_seg_iou=args.big_seg_iou,
+        big_seg_imgsz=args.big_seg_imgsz,
+        big_force_tile=args.big_force_tile,
+        big_tile=args.big_tile,
+        big_overlap=args.big_overlap,
+        big_use_clahe=args.big_clahe,
+        clahe_clip=args.clahe_clip,
+        clahe_grid=args.clahe_grid,
+        debug_dir=debug_dir,
+        debug_prefix=debug_prefix,
+        # Use one final postprocess entry for full mask.
+        post_open_ksize=0,
+        post_close_ksize=0,
+        post_min_area=0,
+        roi_v3=args.roi_v3,
+        d20_class_id=args.d20_class_id,
+        d20_pad_ratio=args.d20_pad_ratio,
+        d20_pad_min=args.d20_pad_min,
+        d20_seg_conf=args.d20_seg_conf,
+        d20_seg_thr=args.d20_seg_thr,
+        d20_seg_iou=args.d20_seg_iou,
+        d20_seg_imgsz=args.d20_seg_imgsz,
+        d20_clahe=args.d20_clahe,
+        adaptive_tile=args.adaptive_tile,
+        adaptive_min_tile=args.adaptive_min_tile,
+        adaptive_max_tile=args.adaptive_max_tile,
+        adaptive_target_long_tiles=args.adaptive_target_long_tiles,
+        tile_overlap_ratio=args.tile_overlap_ratio,
+        tile_fusion=args.tile_fusion,
+        tile_fusion_thr=args.tile_fusion_thr,
+        highres_enabled=args.highres_seg,
+        highres_imgsz=args.highres_imgsz,
+        highres_min_side=args.highres_min_side,
+        debug_levels=args.debug_levels,
+        enable_d20_structure_score=args.enable_d20_structure_score,
+        d20_structure_thr=args.d20_structure_thr,
+        enable_lane_marking_suppress=args.enable_lane_marking_suppress,
+        lane_marking_bright_thr=args.lane_marking_bright_thr,
+        lane_marking_sat_thr=args.lane_marking_sat_thr,
+    )
+    full_mask = apply_final_mask_postprocess(full_mask, args.post_open, args.post_close, args.post_min_area)
+    return full_mask, det_res
+
+
+def make_writer(path: Path, width: int, height: int, fps: float, codec: str):
+    codec = (codec or "mp4v").strip()
+    if len(codec) != 4:
+        raise ValueError(f"video codec must be 4 chars, got: {codec}")
+    fourcc = cv2.VideoWriter_fourcc(*codec)
+    writer = cv2.VideoWriter(str(path), fourcc, float(fps), (int(width), int(height)))
+    if not writer.isOpened():
+        raise RuntimeError(
+            f"Cannot open VideoWriter: path={path}, codec={codec}, fps={fps}, size=({width},{height})"
+        )
+    return writer
+
+
+def infer_video(
+    video_path: Path,
+    run_dir: Path,
+    det_model: YOLO,
+    seg_model: YOLO,
+    det_names: dict,
+    args,
+    debug_dir: Path = None,
+):
+    cap = cv2.VideoCapture(str(video_path))
+    if not cap.isOpened():
+        raise RuntimeError(f"Cannot open video: {video_path}")
+
+    total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+    src_fps = float(cap.get(cv2.CAP_PROP_FPS))
+    out_fps = src_fps if src_fps > 0 else 25.0
+
+    ok, first_frame = cap.read()
+    if (not ok) or first_frame is None:
+        cap.release()
+        raise RuntimeError(f"Video opened but first frame cannot be read: {video_path}")
+
+    h, w = first_frame.shape[:2]
+    overlay_video_path = run_dir / f"{video_path.stem}__overlay.mp4"
+    overlay_writer = make_writer(overlay_video_path, w, h, out_fps, args.video_codec)
+
+    mask_writer = None
+    mask_video_path = run_dir / f"{video_path.stem}__mask.mp4"
+    if args.save_mask_video:
+        mask_writer = make_writer(mask_video_path, w, h, out_fps, args.video_codec)
+
+    raw_frame_dir = None
+    overlay_frame_dir = None
+    mask_frame_dir = None
+    if args.save_frames:
+        raw_frame_dir = run_dir / "frames_raw"
+        overlay_frame_dir = run_dir / "frames_overlay"
+        mask_frame_dir = run_dir / "frames_mask"
+        ensure_dir(raw_frame_dir)
+        ensure_dir(overlay_frame_dir)
+        ensure_dir(mask_frame_dir)
+
+    frame_step = max(1, int(args.frame_step))
+    max_frames = int(args.max_frames)
+    total_text = str(total_frames) if total_frames > 0 else "?"
+
+    frame_idx = 0
+    infer_count = 0
+    infer_time_sum = 0.0
+    read_failed = False
+
+    try:
+        while True:
+            if max_frames > 0 and frame_idx >= max_frames:
+                break
+
+            if frame_idx == 0:
+                frame = first_frame
+            else:
+                ok, frame = cap.read()
+                if (not ok) or frame is None:
+                    read_failed = True
+                    break
+
+            frame_idx += 1
+            do_infer = ((frame_idx - 1) % frame_step == 0)
+
+            if do_infer:
+                t0 = time.perf_counter()
+                mask_u8, det_res = cascade_predict_one(
+                    frame,
+                    det_model,
+                    seg_model,
+                    args,
+                    debug_dir=debug_dir,
+                    debug_prefix=f"{video_path.stem}_f{frame_idx:06d}",
+                )
+                dt = time.perf_counter() - t0
+                infer_time_sum += dt
+                infer_count += 1
+                avg_dt = infer_time_sum / max(1, infer_count)
+                avg_fps = 1.0 / avg_dt if avg_dt > 0 else 0.0
+                if args.show_progress:
+                    print(
+                        f"[Frame {frame_idx}/{total_text}] "
+                        f"time={dt*1000:.1f} ms  avg={avg_dt*1000:.1f} ms  fps={avg_fps:.2f}"
+                    )
+            else:
+                mask_u8 = np.zeros((h, w), dtype=np.uint8)
+                det_res = None
+                if args.show_progress:
+                    print(f"[Frame {frame_idx}/{total_text}] skipped by frame_step={frame_step}")
+
+            det_vis = draw_det_boxes(frame, det_res, det_names, conf_thr=args.det_conf) if det_res is not None else frame.copy()
+            overlay = overlay_mask_red(det_vis, mask_u8, alpha=0.45)
+
+            overlay_writer.write(overlay)
+            if mask_writer is not None:
+                mask_writer.write(cv2.cvtColor(mask_u8, cv2.COLOR_GRAY2BGR))
+
+            if args.save_frames and do_infer:
+                fid = f"frame_{frame_idx:06d}"
+                cv2.imwrite(str(raw_frame_dir / f"{fid}.jpg"), frame)
+                cv2.imwrite(str(overlay_frame_dir / f"{fid}__overlay.jpg"), overlay)
+                cv2.imwrite(str(mask_frame_dir / f"{fid}__mask.png"), mask_u8)
+    finally:
+        cap.release()
+        overlay_writer.release()
+        if mask_writer is not None:
+            mask_writer.release()
+
+    if read_failed:
+        print(f"[WARN] frame read failed near frame {frame_idx + 1}, stopped early.")
+
+    avg_dt = infer_time_sum / max(1, infer_count)
+    avg_fps = 1.0 / avg_dt if avg_dt > 0 else 0.0
+    print(
+        f"[VIDEO DONE] frames_read={frame_idx}, frames_inferred={infer_count}, "
+        f"avg_time={avg_dt*1000:.1f} ms, avg_fps={avg_fps:.2f}"
+    )
+    print(f"[VIDEO OUT ] overlay={overlay_video_path}")
+    if args.save_mask_video:
+        print(f"[VIDEO OUT ] mask={mask_video_path}")
+
+
+def main():
+    ap = argparse.ArgumentParser()
+
+    ap.add_argument("--det", required=True, help="path to det best.pt")
+    ap.add_argument("--seg", required=True, help="path to seg best.pt (yolov8-seg)")
+    ap.add_argument("--source", required=True, help="image file / image directory / video file")
+    ap.add_argument("--outdir", default="uestc4006p/runs", help="output dir")
+    ap.add_argument("--name-mode", choices=["new", "legacy"], default="new",
+                    help="new: mode_task_data_model[_tag], legacy: old naming")
+    ap.add_argument("--run-tag", default="", help="optional run tag")
+
+    ap.add_argument("--det-conf", type=float, default=0.15)
+    ap.add_argument("--det-iou", type=float, default=0.50)
+    ap.add_argument("--det-imgsz", type=int, default=0, help="det inference imgsz, 0 means model default")
+
+    ap.add_argument("--seg-conf", type=float, default=0.10)
+    ap.add_argument("--seg-thr", type=float, default=0.30)
+    ap.add_argument("--seg-iou", type=float, default=0.50)
+    ap.add_argument("--seg-imgsz", type=int, default=1280)
+
+    ap.add_argument("--pad-ratio", type=float, default=ROI_V3_DEFAULTS["pad_ratio"])
+    ap.add_argument("--pad-min", type=int, default=ROI_V3_DEFAULTS["pad_min"])
+    ap.add_argument("--max-rois", type=int, default=80)
+    ap.add_argument("--det-classes", nargs="*", type=int, default=None)
+    ap.add_argument("--max-area-ratio", type=float, default=0.60)
+
+    ap.add_argument("--tile-min-side", type=int, default=1400)
+    ap.add_argument("--tile", type=int, default=1280)
+    ap.add_argument("--overlap", type=int, default=256)
+    ap.add_argument("--no-tile", action="store_true")
+
+    ap.add_argument("--big-classes", nargs="*", type=int, default=[2, 3],
+                    help="det class ids treated as big-damage (default: 2 3)")
+    ap.add_argument("--big-seg-conf", type=float, default=0.08)
+    ap.add_argument("--big-seg-thr", type=float, default=0.25)
+    ap.add_argument("--big-seg-iou", type=float, default=0.50)
+    ap.add_argument("--big-seg-imgsz", type=int, default=1280)
+    ap.add_argument("--big-force-tile", action="store_true", help="force tiling for big classes")
+    ap.add_argument("--big-tile", type=int, default=1280)
+    ap.add_argument("--big-overlap", type=int, default=384)
+    ap.add_argument("--big-clahe", action="store_true", help="apply CLAHE on ROI for big classes")
+    ap.add_argument("--clahe-clip", type=float, default=ROI_V3_DEFAULTS["clahe_clip"])
+    ap.add_argument("--clahe-grid", type=int, default=ROI_V3_DEFAULTS["clahe_grid"])
+
+    ap.add_argument("--post-open", type=int, default=0)
+    ap.add_argument("--post-close", type=int, default=3)
+    ap.add_argument("--post-min-area", type=int, default=25)
+
+    ap.add_argument("--roi-v3", action="store_true", help="enable ROI-v3 enhanced policy")
+    ap.add_argument("--d20-class-id", type=int, default=ROI_V3_DEFAULTS["d20_class_id"])
+    ap.add_argument("--d20-pad-ratio", type=float, default=ROI_V3_DEFAULTS["d20_pad_ratio"])
+    ap.add_argument("--d20-pad-min", type=int, default=ROI_V3_DEFAULTS["d20_pad_min"])
+    ap.add_argument("--d20-seg-conf", type=float, default=ROI_V3_DEFAULTS["d20_seg_conf"])
+    ap.add_argument("--d20-seg-thr", type=float, default=ROI_V3_DEFAULTS["d20_seg_thr"])
+    ap.add_argument("--d20-seg-iou", type=float, default=ROI_V3_DEFAULTS["d20_seg_iou"])
+    ap.add_argument("--d20-seg-imgsz", type=int, default=ROI_V3_DEFAULTS["d20_seg_imgsz"])
+    ap.add_argument("--d20-clahe", action="store_true", help="apply CLAHE only for D20 ROIs")
+    ap.add_argument("--adaptive-tile", action="store_true", help="enable adaptive tiling for oversized ROIs")
+    ap.add_argument("--adaptive-min-tile", type=int, default=ROI_V3_DEFAULTS["adaptive_min_tile"])
+    ap.add_argument("--adaptive-max-tile", type=int, default=ROI_V3_DEFAULTS["adaptive_max_tile"])
+    ap.add_argument("--adaptive-target-long-tiles", type=int, default=ROI_V3_DEFAULTS["adaptive_target_long_tiles"])
+    ap.add_argument("--tile-overlap-ratio", type=float, default=ROI_V3_DEFAULTS["tile_overlap_ratio"])
+    ap.add_argument("--tile-fusion", choices=["max", "avg"], default=ROI_V3_DEFAULTS["tile_fusion"])
+    ap.add_argument("--tile-fusion-thr", type=float, default=ROI_V3_DEFAULTS["tile_fusion_thr"])
+    ap.add_argument("--highres-seg", action="store_true", help="enable high-resolution seg inference")
+    ap.add_argument("--highres-imgsz", type=int, default=ROI_V3_DEFAULTS["highres_imgsz"])
+    ap.add_argument("--highres-min-side", type=int, default=ROI_V3_DEFAULTS["highres_min_side"])
+    ap.add_argument("--debug-levels", action="store_true", help="save multi-level debug outputs")
+    ap.add_argument("--enable-d20-structure-score", action="store_true", help="enable D20 structure scoring")
+    ap.add_argument("--d20-structure-thr", type=float, default=ROI_V3_DEFAULTS["d20_structure_thr"])
+    ap.add_argument("--enable-lane-marking-suppress", action="store_true",
+                    help="enable lane-like marking suppression under low structure score")
+    ap.add_argument("--lane-marking-bright-thr", type=int, default=ROI_V3_DEFAULTS["lane_marking_bright_thr"])
+    ap.add_argument("--lane-marking-sat-thr", type=int, default=ROI_V3_DEFAULTS["lane_marking_sat_thr"])
+
+    ap.add_argument("--save-mask-video", action="store_true", help="save pure mask video")
+    ap.add_argument("--save-frames", action="store_true", help="save key frames (raw/overlay/mask)")
+    ap.add_argument("--frame-step", type=int, default=1, help="infer every N-th frame")
+    ap.add_argument("--max-frames", type=int, default=0, help="read at most this many frames, 0 means no limit")
+    ap.add_argument("--video-codec", default="mp4v", help="cv2 VideoWriter fourcc")
+    ap.add_argument("--show-progress", action="store_true", help="print per-frame progress for video")
+
+    ap.add_argument("--debug-rois", action="store_true")
+    args = ap.parse_args()
+
+    det_path = Path(args.det).resolve()
+    seg_path = Path(args.seg).resolve()
+    src = Path(args.source).resolve()
+    source_kind = infer_source_kind(src)
+
+    outdir = Path(args.outdir)
+    if not outdir.is_absolute():
+        outdir = (Path.cwd() / outdir).resolve()
+    ensure_dir(outdir)
+
+    det_model = YOLO(str(det_path))
+    seg_model = YOLO(str(seg_path))
+    det_names = det_model.names if hasattr(det_model, "names") else {}
+
+    images = []
+    if source_kind in {"image_dir", "image_file"}:
+        images = collect_images(src)
+        if len(images) == 0:
+            raise FileNotFoundError(f"No images found in: {src}")
+
+    det_parent = det_path.parent.parent.name if det_path.parent.name.lower() == "weights" else det_path.parent.name
+    seg_parent = seg_path.parent.parent.name if seg_path.parent.name.lower() == "weights" else seg_path.parent.name
+    det_short = short_tag_from_ckpt_parent(det_parent, "det")
+    seg_short = short_tag_from_ckpt_parent(seg_parent, "seg")
+
+    if args.name_mode == "legacy":
+        run_dir = outdir / f"cascade__{det_short}__{seg_short}"
+    else:
+        if source_kind == "image_dir":
+            data_token = src.name
+        elif source_kind == "video_file":
+            data_token = src.stem
+        else:
+            data_token = src.parent.name
+        model_token = shorten_model_name(seg_path.stem)
+        main_name = make_output_dir_name(
+            mode="pred",
+            task="cascade",
+            data=data_token,
+            model=model_token,
+            tag=args.run_tag,
+        )
+        _, run_dir = resolve_unique_dir(outdir, main_name)
+    ensure_dir(run_dir)
+
+    debug_dir = None
+    if args.debug_rois:
+        debug_dir = run_dir / "debug_rois"
+        ensure_dir(debug_dir)
+
+    info_path = run_dir / "RUN_INFO.txt"
+    with open(info_path, "w", encoding="utf-8") as f:
+        f.write("UESTC4006P - Cascade Inference v3c (Class-Aware) Run Info\n")
+        f.write("====================================================\n")
+        f.write(f"Time: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
+        f.write("\n[Weights]\n")
+        f.write(f"DET: {det_path}\n")
+        f.write(f"SEG: {seg_path}\n")
+        f.write("\n[Test Source]\n")
+        f.write(f"SOURCE: {src}\n")
+        f.write(f"SOURCE_TYPE: {source_kind}\n")
+        f.write("\n[Params]\n")
+        f.write(f"det_conf={args.det_conf}, det_iou={args.det_iou}, det_imgsz={args.det_imgsz}\n")
+        f.write(f"base_seg_conf={args.seg_conf}, base_seg_thr={args.seg_thr}, base_seg_iou={args.seg_iou}, base_seg_imgsz={args.seg_imgsz}\n")
+        f.write(f"pad_ratio={args.pad_ratio}, pad_min={args.pad_min}\n")
+        f.write(f"max_rois={args.max_rois}, det_classes={args.det_classes if args.det_classes is not None else 'ALL'}\n")
+        f.write(f"max_area_ratio={args.max_area_ratio}\n")
+        f.write(f"use_tile_for_big_roi={not args.no_tile}, tile_min_side={args.tile_min_side}, tile={args.tile}, overlap={args.overlap}\n")
+        f.write("\n[Class-aware Big-Damage Policy]\n")
+        f.write(f"big_classes={args.big_classes}\n")
+        f.write(f"big_seg_conf={args.big_seg_conf}, big_seg_thr={args.big_seg_thr}, big_seg_iou={args.big_seg_iou}, big_seg_imgsz={args.big_seg_imgsz}\n")
+        f.write(f"big_force_tile={args.big_force_tile}, big_tile={args.big_tile}, big_overlap={args.big_overlap}\n")
+        f.write(f"big_clahe={args.big_clahe}, clahe_clip={args.clahe_clip}, clahe_grid={args.clahe_grid}\n")
+        f.write("\n[ROI-v3]\n")
+        f.write(f"roi_v3={args.roi_v3}, d20_class_id={args.d20_class_id}\n")
+        f.write(f"d20_pad_ratio={args.d20_pad_ratio}, d20_pad_min={args.d20_pad_min}\n")
+        f.write(f"d20_seg_conf={args.d20_seg_conf}, d20_seg_thr={args.d20_seg_thr}, d20_seg_iou={args.d20_seg_iou}, d20_seg_imgsz={args.d20_seg_imgsz}\n")
+        f.write(f"d20_clahe={args.d20_clahe}\n")
+        f.write(f"adaptive_tile={args.adaptive_tile}, adaptive_min_tile={args.adaptive_min_tile}, adaptive_max_tile={args.adaptive_max_tile}, adaptive_target_long_tiles={args.adaptive_target_long_tiles}\n")
+        f.write(f"tile_overlap_ratio={args.tile_overlap_ratio}, tile_fusion={args.tile_fusion}, tile_fusion_thr={args.tile_fusion_thr}\n")
+        f.write(f"highres_seg={args.highres_seg}, highres_imgsz={args.highres_imgsz}, highres_min_side={args.highres_min_side}\n")
+        f.write("\n[D20 Structure]\n")
+        f.write(f"enable_d20_structure_score={args.enable_d20_structure_score}, d20_structure_thr={args.d20_structure_thr}\n")
+        f.write(f"enable_lane_marking_suppress={args.enable_lane_marking_suppress}, lane_marking_bright_thr={args.lane_marking_bright_thr}, lane_marking_sat_thr={args.lane_marking_sat_thr}\n")
+        f.write("\n[Postprocess - Final Full Mask]\n")
+        f.write("applied_stage=final_full_mask_before_save\n")
+        f.write(f"post_open={args.post_open}, post_close={args.post_close}, post_min_area={args.post_min_area}\n")
+        f.write("\n[Video Options]\n")
+        f.write(f"save_mask_video={args.save_mask_video}, save_frames={args.save_frames}, frame_step={args.frame_step}, max_frames={args.max_frames}\n")
+        f.write(f"video_codec={args.video_codec}, show_progress={args.show_progress}\n")
+        f.write("\n[Debug]\n")
+        f.write(f"debug_rois={args.debug_rois}, debug_levels={args.debug_levels}\n")
+        f.write("\n[Outputs]\n")
+        if source_kind == "video_file":
+            f.write("- <video>__overlay.mp4 : overlay video\n")
+            if args.save_mask_video:
+                f.write("- <video>__mask.mp4 : pure mask video\n")
+            if args.save_frames:
+                f.write("- frames_raw/*, frames_overlay/*, frames_mask/* : key frames\n")
+        else:
+            f.write("- <image>__mask.png : final stitched binary mask (255=crack-like)\n")
+            f.write("- <image>__overlay.jpg : det boxes + red mask overlay\n")
+        if args.debug_rois:
+            f.write("- debug_rois/* : ROI and tile overlays for debugging\n")
+        f.write("====================================================\n")
+
+    seg_wm = extract_weight_meta(str(seg_path))
+    run_meta = {
+        "mode": "pred",
+        "task": "cascade",
+        "dataset": str(src),
+        "model": str(seg_path.stem),
+        "tag": args.run_tag,
+        "created_at": now_iso(),
+        "weight_path": str(seg_path),
+        "source": str(src),
+        "source_type": source_kind,
+        "notes": "",
+        "weight_file": seg_wm["weight_file"],
+        "weight_parent_dir": seg_wm["weight_parent_dir"],
+        "used_from_train_dir": seg_wm["used_from_train_dir"],
+        "det_weight_path": str(det_path),
+        "inference_kind": source_kind,
+    }
+    write_run_meta_yaml(run_dir, run_meta)
+
+    print("RUN_INFO:", info_path)
+    print("RUN_DIR :", run_dir)
+
+    if source_kind == "video_file":
+        infer_video(
+            src,
+            run_dir,
+            det_model,
+            seg_model,
+            det_names,
+            args,
+            debug_dir=debug_dir,
+        )
+        print("DONE.")
+        return
+
+    for p in images:
+        img = cv2.imread(str(p))
+        if img is None:
+            print(f"[WARN] cannot read: {p}")
+            continue
+
+        stem = p.stem
+        full_mask, det_res = cascade_predict_one(
+            img,
+            det_model,
+            seg_model,
+            args,
+            debug_dir=debug_dir,
+            debug_prefix=stem,
+        )
+
+        det_vis = draw_det_boxes(img, det_res, det_names, conf_thr=args.det_conf)
+        overlay = overlay_mask_red(det_vis, full_mask, alpha=0.45)
+
+        mask_path = run_dir / f"{stem}__mask.png"
+        ov_path = run_dir / f"{stem}__overlay.jpg"
+
+        ok1 = cv2.imwrite(str(mask_path), full_mask)
+        ok2 = cv2.imwrite(str(ov_path), overlay)
+        if not ok1 or not ok2:
+            raise RuntimeError(
+                f"cv2.imwrite failed: {p.name}\n"
+                f"  ok_mask={ok1}, ok_overlay={ok2}\n"
+                f"  mask_path={mask_path}\n"
+                f"  overlay_path={ov_path}\n"
+                f"  run_dir={run_dir}"
+            )
         print(f"[OK] {p.name} -> saved")
 
     print("DONE.")

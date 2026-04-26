@@ -38,9 +38,9 @@ def scan_hardcoded_paths(root: Path, target_tools: Path) -> list[tuple[str, int,
 
 def main():
     ap = argparse.ArgumentParser(description="tools 命名迁移 dry-run（不做真实改动）")
-    ap.add_argument("--repo-root", default=r"E:\repositories\ultralytics")
-    ap.add_argument("--tools-dir", default=r"E:\repositories\ultralytics\tools")
-    ap.add_argument("--outdir", default=r"E:\repositories\ultralytics\uestc4006p\scripts\dryrun_outputs")
+    ap.add_argument("--repo-root", default=str(Path(__file__).resolve().parents[2]))
+    ap.add_argument("--tools-dir", default=str(Path(__file__).resolve().parents[2] / "tools"))
+    ap.add_argument("--outdir", default=str(Path(__file__).resolve().parent / "dryrun_outputs"))
     args = ap.parse_args()
 
     repo_root = Path(args.repo_root).resolve()

@@ -222,9 +222,9 @@ def _write_report(path: Path, run_rows: list[MapRow], ck_rows: list[MapRow]) -> 
 
 def main():
     ap = argparse.ArgumentParser(description="runs/checkpoints 命名迁移 dry-run")
-    ap.add_argument("--runs-root", default=r"E:\repositories\ultralytics\uestc4006p\runs")
-    ap.add_argument("--checkpoints-root", default=r"E:\repositories\ultralytics\uestc4006p\checkpoints")
-    ap.add_argument("--outdir", default=r"E:\repositories\ultralytics\uestc4006p\scripts\dryrun_outputs")
+    ap.add_argument("--runs-root", default=str(Path(__file__).resolve().parents[1] / "runs"))
+    ap.add_argument("--checkpoints-root", default=str(Path(__file__).resolve().parents[1] / "checkpoints"))
+    ap.add_argument("--outdir", default=str(Path(__file__).resolve().parent / "dryrun_outputs"))
     args = ap.parse_args()
 
     runs_root = Path(args.runs_root).resolve()

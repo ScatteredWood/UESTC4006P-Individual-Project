@@ -4,12 +4,13 @@ from pathlib import Path
 import os
 from naming_utils import make_output_dir_name, resolve_unique_dir
 
-DATA_ROOT = Path(r"E:\Large Files\UESTC4006P Individual Project (2025-26)\datasets")
-REPO_ROOT = Path(r"E:\repositories\ultralytics")
-APP_ROOT  = REPO_ROOT / "uestc4006p"
+THIS_FILE = Path(__file__).resolve()
+REPO_ROOT = THIS_FILE.parents[2]
+APP_ROOT = REPO_ROOT / "uestc4006p"
+DATA_ROOT = Path(os.environ.get("UESTC4006P_DATA_ROOT", str(REPO_ROOT / "datasets"))).expanduser().resolve()
 
 YOLO_CONFIG_DIR = APP_ROOT / ".yolo_config"
-os.environ["YOLO_CONFIG_DIR"] = str(YOLO_CONFIG_DIR)
+os.environ.setdefault("YOLO_CONFIG_DIR", str(YOLO_CONFIG_DIR))
 
 @dataclass
 class ExpCfg:
