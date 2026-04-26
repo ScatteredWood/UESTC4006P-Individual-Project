@@ -212,6 +212,19 @@ uestc4006p/.yolo_config/
 # Training / validation / prediction outputs
 uestc4006p/runs/
 **/runs/
+uestc4006p/checkpoints/
+**/checkpoints/
+uestc4006p/output/
+uestc4006p/outputs/
+uestc4006p/predict_outputs/
+uestc4006p/val_outputs/
+uestc4006p/train_outputs/
+uestc4006p/results/
+uestc4006p/export/
+uestc4006p/exports/
+uestc4006p/wandb/
+uestc4006p/tensorboard/
+**/events.out.tfevents*
 
 # Weights / exports / logs (if generated elsewhere)
 **/weights/

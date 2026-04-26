@@ -155,7 +155,7 @@ def write_outputs(rows: list[MappingRow], out_csv: Path, out_md: Path):
 
 def main():
     ap = argparse.ArgumentParser(description="历史 runs 目录重命名预演（dry-run，不执行重命名）")
-    ap.add_argument("--runs-root", default=r"E:\repositories\ultralytics\uestc4006p\runs")
+    ap.add_argument("--runs-root", default=str(Path(__file__).resolve().parents[1] / "runs"))
     ap.add_argument("--outdir", default="")
     ap.add_argument("--stdout-only", action="store_true", help="仅打印映射，不写文件")
     args = ap.parse_args()

@@ -35,7 +35,7 @@ def write_report(report_csv: Path, results: list[ResultRow]) -> None:
 
 def main():
     ap = argparse.ArgumentParser(description="按 mapping.csv 执行 runs 目录重命名")
-    ap.add_argument("--runs-root", default=r"E:\repositories\ultralytics\uestc4006p\runs")
+    ap.add_argument("--runs-root", default=str(Path(__file__).resolve().parents[1] / "runs"))
     ap.add_argument("--mapping-csv", required=True)
     ap.add_argument("--report-csv", default="")
     args = ap.parse_args()

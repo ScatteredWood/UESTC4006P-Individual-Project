@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 import json
 import sys
 import importlib.util
@@ -19,6 +20,13 @@ CASCADE_SCRIPT = REPO_ROOT / "uestc4006p" / "scripts" / "cascade_infer_detseg.py
 RUNS_ROOT = Path(r"E:\Large Files\UESTC4006P Individual Project (2025-26)\要使用的训练结果汇总")
 SOURCE_DIR = Path(r"E:\Large Files\UESTC4006P Individual Project (2025-26)\test\seg")
 OUT_ROOT = RUNS_ROOT / "_predict_exports" / "cascade_standard"
+
+# repo-relative defaults, overridable via environment variables
+REPO_ROOT = Path(__file__).resolve().parents[2]
+CASCADE_SCRIPT = REPO_ROOT / "uestc4006p" / "scripts" / "cascade_infer_detseg.py"
+RUNS_ROOT = Path(os.environ.get("UESTC4006P_RUNS_ROOT", str(REPO_ROOT / "uestc4006p" / "runs"))).expanduser()
+SOURCE_DIR = Path(os.environ.get("UESTC4006P_SEG_SOURCE", str(REPO_ROOT / "data" / "seg_samples"))).expanduser()
+OUT_ROOT = Path(os.environ.get("UESTC4006P_CASCADE_OUT_ROOT", str(RUNS_ROOT / "_predict_exports" / "cascade_standard"))).expanduser()
 
 DET_WHITELIST: list[str] = []
 SEG_WHITELIST: list[str] = []

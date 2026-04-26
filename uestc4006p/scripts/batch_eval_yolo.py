@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 import json
 import math
 import traceback
@@ -33,6 +34,15 @@ DET_VAL_IMAGES = Path(
 SEG_VAL_IMAGES = Path(
     r"E:\Large Files\UESTC4006P Individual Project (2025-26)\datasets\custom\crack500_SS305_CSa100_cs4029\crack500_SS305_CSa100_cs4029\images\val"
 )
+
+# repo-relative defaults, overridable via environment variables
+REPO_ROOT = Path(__file__).resolve().parents[2]
+RUNS_ROOT = Path(os.environ.get("UESTC4006P_RUNS_ROOT", str(REPO_ROOT / "uestc4006p" / "runs"))).expanduser()
+EXPORT_ROOT = Path(os.environ.get("UESTC4006P_EVAL_EXPORT_ROOT", str(RUNS_ROOT / "_eval_exports"))).expanduser()
+DATA_YAML_DIR = EXPORT_ROOT / "data_yaml"
+RUN_REPORTS_DIR = EXPORT_ROOT / "run_reports"
+DET_VAL_IMAGES = Path(os.environ.get("UESTC4006P_DET_VAL_IMAGES", str(REPO_ROOT / "data" / "det_val" / "images" / "val"))).expanduser()
+SEG_VAL_IMAGES = Path(os.environ.get("UESTC4006P_SEG_VAL_IMAGES", str(REPO_ROOT / "data" / "seg_val" / "images" / "val"))).expanduser()
 
 # 统一评估输入尺寸：为了公平比较，请固定
 DET_IMGSZ = 1024

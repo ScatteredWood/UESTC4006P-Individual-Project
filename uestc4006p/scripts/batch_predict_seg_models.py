@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 from pathlib import Path
 from typing import Iterable
 import time
@@ -15,6 +16,12 @@ from ultralytics import YOLO
 RUNS_ROOT = Path(r"E:\Large Files\UESTC4006P Individual Project (2025-26)\要使用的训练结果汇总")
 SOURCE_DIR = Path(r"E:\Large Files\UESTC4006P Individual Project (2025-26)\test\seg")
 OUT_ROOT = RUNS_ROOT / "_predict_exports" / "seg_direct"
+
+# repo-relative defaults, overridable via environment variables
+REPO_ROOT = Path(__file__).resolve().parents[2]
+RUNS_ROOT = Path(os.environ.get("UESTC4006P_RUNS_ROOT", str(REPO_ROOT / "uestc4006p" / "runs"))).expanduser()
+SOURCE_DIR = Path(os.environ.get("UESTC4006P_SEG_SOURCE", str(REPO_ROOT / "data" / "seg_samples"))).expanduser()
+OUT_ROOT = Path(os.environ.get("UESTC4006P_SEG_OUT_ROOT", str(RUNS_ROOT / "_predict_exports" / "seg_direct"))).expanduser()
 
 WHITELIST: list[str] = []
 EXCLUDE: list[str] = []

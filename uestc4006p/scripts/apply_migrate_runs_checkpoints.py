@@ -129,11 +129,11 @@ def write_summary(
 
 def main() -> None:
     ap = argparse.ArgumentParser(description="Apply runs/checkpoints migration from dry-run mapping CSV")
-    ap.add_argument("--runs-root", default=r"E:\repositories\ultralytics\uestc4006p\runs")
-    ap.add_argument("--checkpoints-root", default=r"E:\repositories\ultralytics\uestc4006p\checkpoints")
-    ap.add_argument("--runs-mapping", default=r"E:\repositories\ultralytics\uestc4006p\scripts\dryrun_outputs\rename_mapping.csv")
-    ap.add_argument("--checkpoints-mapping", default=r"E:\repositories\ultralytics\uestc4006p\scripts\dryrun_outputs\checkpoint_mapping.csv")
-    ap.add_argument("--outdir", default=r"E:\repositories\ultralytics\uestc4006p\scripts\migration_outputs")
+    ap.add_argument("--runs-root", default=str(Path(__file__).resolve().parents[1] / "runs"))
+    ap.add_argument("--checkpoints-root", default=str(Path(__file__).resolve().parents[1] / "checkpoints"))
+    ap.add_argument("--runs-mapping", default=str(Path(__file__).resolve().parent / "dryrun_outputs" / "rename_mapping.csv"))
+    ap.add_argument("--checkpoints-mapping", default=str(Path(__file__).resolve().parent / "dryrun_outputs" / "checkpoint_mapping.csv"))
+    ap.add_argument("--outdir", default=str(Path(__file__).resolve().parent / "migration_outputs"))
     args = ap.parse_args()
 
     runs_root = Path(args.runs_root).resolve()
