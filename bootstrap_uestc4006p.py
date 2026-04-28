@@ -2,7 +2,7 @@ from pathlib import Path
 import textwrap
 
 # ===============================
-# 你只需要确认这两个路径
+# 只需要确认这两个路径
 # ===============================
 REPO_ROOT = Path(r"E:\repositories\ultralytics")
 DATA_ROOT = Path(r"E:\Large Files\UESTC4006P Individual Project (2025-26)\datasets")
